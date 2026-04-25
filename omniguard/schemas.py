@@ -84,6 +84,7 @@ class AnalysisResult:
     tamper_score_max: float
     tamper_ratio: float
     metadata: dict[str, Any]
+    comparison_metrics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(
@@ -94,6 +95,7 @@ class AnalysisResult:
                 "tamper_score_mean": self.tamper_score_mean,
                 "tamper_score_max": self.tamper_score_max,
                 "tamper_ratio": self.tamper_ratio,
+                "comparison_metrics": self.comparison_metrics,
                 "metadata": self.metadata,
             }
         )

@@ -21,6 +21,11 @@ def ensure_rgb_uint8(image: np.ndarray) -> np.ndarray:
     array = np.asarray(image)
     if array.ndim == 2:
         array = np.stack([array] * 3, axis=-1)
+    if array.ndim == 3 and array.shape[2] == 1:
+        array = np.repeat(array, 3, axis=2)
+    if array.ndim == 3 and array.shape[2] == 4:
+        # Gradio and PNG inputs can arrive in RGBA; the analysis pipeline expects RGB.
+        array = array[..., :3]
     if array.ndim != 3 or array.shape[2] != 3:
         raise ValueError("Expected an RGB image with shape HxWx3.")
     if array.dtype != np.uint8:

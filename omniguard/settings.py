@@ -41,6 +41,9 @@ class RuntimeSettings:
         )
     )
     use_diffusers: bool = field(default_factory=lambda: _env_flag("OMNIGUARD_USE_DIFFUSERS", True))
+    allow_inpaint_model_download: bool = field(
+        default_factory=lambda: _env_flag("OMNIGUARD_ALLOW_INPAINT_MODEL_DOWNLOAD", False)
+    )
     public_share: bool = field(default_factory=lambda: _env_flag("OMNIGUARD_SHARE", False))
     hmac_secret: str = field(
         default_factory=lambda: os.getenv("OMNIGUARD_HMAC_SECRET", "omniguard-demo-key")

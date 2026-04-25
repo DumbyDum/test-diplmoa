@@ -8,7 +8,19 @@ from typing import Callable
 import numpy as np
 
 from . import attacks
-from .metrics import bit_accuracy, mask_dice, mask_iou, psnr, ssim
+from .metrics import (
+    bit_accuracy,
+    mae,
+    mask_dice,
+    mask_f1,
+    mask_iou,
+    mask_precision,
+    mask_recall,
+    mse,
+    psnr,
+    rmse,
+    ssim,
+)
 from .schemas import AttackResult
 from .service import OmniGuardEngine
 
@@ -69,8 +81,13 @@ class BenchmarkRunner:
                 expected_document_id=document_id,
                 reference_bits=protection.payload.encoded_bits,
                 output_dir=attack_dir,
+                reference_image=protected,
+                analysis_mode="hybrid",
             )
-            metrics = {
+            metrics: dict[str, object] = {
+                "mse_protected_vs_attacked": mse(protected, attacked.image),
+                "mae_protected_vs_attacked": mae(protected, attacked.image),
+                "rmse_protected_vs_attacked": rmse(protected, attacked.image),
                 "psnr_protected_vs_attacked": psnr(protected, attacked.image),
                 "ssim_protected_vs_attacked": ssim(protected, attacked.image),
                 "payload_bit_accuracy": bit_accuracy(
@@ -82,8 +99,12 @@ class BenchmarkRunner:
                 "tamper_score_mean": analysis.tamper_score_mean,
                 "tamper_score_max": analysis.tamper_score_max,
                 "tamper_ratio": analysis.tamper_ratio,
+                **analysis.comparison_metrics,
             }
             if attacked.mask is not None:
+                metrics["mask_precision"] = mask_precision(attacked.mask, analysis.binary_mask)
+                metrics["mask_recall"] = mask_recall(attacked.mask, analysis.binary_mask)
+                metrics["mask_f1"] = mask_f1(attacked.mask, analysis.binary_mask)
                 metrics["mask_iou"] = mask_iou(attacked.mask, analysis.binary_mask)
                 metrics["mask_dice"] = mask_dice(attacked.mask, analysis.binary_mask)
             predicted_mask_path = attack_dir / "tamper_mask.png"

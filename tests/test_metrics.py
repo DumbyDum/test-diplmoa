@@ -4,7 +4,19 @@ import unittest
 
 import numpy as np
 
-from omniguard.metrics import bit_accuracy, mask_dice, mask_iou, mse, psnr
+from omniguard.metrics import (
+    bit_accuracy,
+    changed_pixel_ratio,
+    mae,
+    mask_dice,
+    mask_f1,
+    mask_iou,
+    mask_precision,
+    mask_recall,
+    mse,
+    psnr,
+    rmse,
+)
 
 
 class MetricsTests(unittest.TestCase):
@@ -12,9 +24,12 @@ class MetricsTests(unittest.TestCase):
         image_a = np.zeros((16, 16, 3), dtype=np.uint8)
         image_b = np.ones((16, 16, 3), dtype=np.uint8) * 10
         self.assertEqual(mse(image_a, image_a), 0.0)
+        self.assertEqual(mae(image_a, image_a), 0.0)
+        self.assertEqual(rmse(image_a, image_a), 0.0)
         self.assertEqual(psnr(image_a, image_a), 100.0)
         self.assertGreater(mse(image_a, image_b), 0.0)
         self.assertLess(psnr(image_a, image_b), 100.0)
+        self.assertGreater(changed_pixel_ratio(image_a, image_b, threshold=1), 0.0)
 
     def test_mask_metrics(self) -> None:
         mask_a = np.zeros((8, 8), dtype=np.uint8)
@@ -23,6 +38,9 @@ class MetricsTests(unittest.TestCase):
         mask_b[2:4, 2:4] = 255
         self.assertEqual(mask_iou(mask_a, mask_b), 1.0)
         self.assertEqual(mask_dice(mask_a, mask_b), 1.0)
+        self.assertEqual(mask_precision(mask_a, mask_b), 1.0)
+        self.assertEqual(mask_recall(mask_a, mask_b), 1.0)
+        self.assertEqual(mask_f1(mask_a, mask_b), 1.0)
 
     def test_bit_accuracy(self) -> None:
         self.assertEqual(bit_accuracy([1, 0, 1], [1, 0, 1]), 1.0)

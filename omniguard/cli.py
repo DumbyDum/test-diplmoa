@@ -24,6 +24,19 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--input", required=True, help="Path to image for analysis.")
     analyze_parser.add_argument("--output-dir", required=True, help="Directory for analysis artifacts.")
     analyze_parser.add_argument("--expected-document-id", default="", help="Expected document ID.")
+    analyze_parser.add_argument("--reference", default="", help="Optional protected reference image.")
+    analyze_parser.add_argument(
+        "--analysis-mode",
+        default="hybrid",
+        choices=["hybrid", "watermark", "reference"],
+        help="Localization mode: hybrid, watermark-only, or reference-only.",
+    )
+    analyze_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Optional override for the binary tamper-mask threshold.",
+    )
 
     benchmark_parser = subparsers.add_parser("benchmark", help="Run the built-in attack benchmark.")
     benchmark_parser.add_argument("--input", required=True, help="Path to input image.")
@@ -61,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
             args.input,
             expected_document_id=args.expected_document_id or None,
             output_dir=args.output_dir,
+            reference_image=args.reference or None,
+            analysis_mode=args.analysis_mode,
+            threshold_override=args.threshold,
         )
         engine.save_json(result.to_dict(), Path(args.output_dir) / "analysis_report.json")
         print(f"Analysis artifacts written to: {Path(args.output_dir).resolve()}")
