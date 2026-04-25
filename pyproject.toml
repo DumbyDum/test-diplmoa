@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omniguard"
+version = "2.0.0"
+description = "Hybrid image watermarking, tamper localization, payload verification and benchmark toolkit."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy",
+  "pillow",
+  "torch",
+  "torchvision",
+  "gradio>=3.50,<4",
+  "opencv-python",
+  "albumentations",
+  "timm",
+  "diffusers",
+  "scipy",
+]
+
+[project.scripts]
+omniguard = "omniguard.cli:main"

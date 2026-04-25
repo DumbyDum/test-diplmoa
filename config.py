@@ -1,4 +1,10 @@
-# Super parameters
+# Legacy compatibility config for older training scripts.
+import os
+
+from omniguard.settings import RuntimeSettings
+
+runtime_settings = RuntimeSettings()
+
 clamp = 2.0
 channels_in = 3
 log10_lr = -5
@@ -28,8 +34,8 @@ val_freq = 10
 
 
 # Dataset
-TRAIN_PATH = '/gdata/cold1/zhangxuanyu/StegFormer/DIV2K/DIV2K_train_HR/'
-VAL_PATH = '/gdata/cold1/zhangxuanyu/HiNet/demo1/'
+TRAIN_PATH = os.getenv('OMNIGUARD_TRAIN_PATH', str(runtime_settings.base_dir / 'data' / 'train'))
+VAL_PATH = os.getenv('OMNIGUARD_VAL_PATH', str(runtime_settings.base_dir / 'data' / 'val'))
 format_train = 'png'
 format_val = 'png'
 
@@ -48,16 +54,29 @@ MODEL_PATH = 'checkpoint/'
 checkpoint_on_error = True
 SAVE_freq = 10
 
-IMAGE_PATH = '/data03/zxy/OmniGuard/'
-IMAGE_PATH_cover = IMAGE_PATH + 'cover/'
-IMAGE_PATH_secret = IMAGE_PATH + 'secret/'
-IMAGE_PATH_steg = IMAGE_PATH + 'steg/'
-IMAGE_PATH_secret_rev = IMAGE_PATH + 'secret-rev/'
-IMAGE_PATH_temp = IMAGE_PATH + 'temp/'
-IMAGE_PATH_fuse = IMAGE_PATH + 'fuse/'
-IMAGE_PATH_demo = IMAGE_PATH + 'demo/'
+BASE_DIR = str(runtime_settings.base_dir)
+IMAGE_PATH = str(runtime_settings.runtime_dir)
 
-# 512
+IMAGE_PATH_cover = os.path.join(IMAGE_PATH, 'cover')
+IMAGE_PATH_secret = os.path.join(IMAGE_PATH, 'secret')
+IMAGE_PATH_steg = os.path.join(IMAGE_PATH, 'steg')
+IMAGE_PATH_secret_rev = os.path.join(IMAGE_PATH, 'secret-rev')
+IMAGE_PATH_temp = os.path.join(IMAGE_PATH, 'temp')
+IMAGE_PATH_fuse = os.path.join(IMAGE_PATH, 'fuse')
+IMAGE_PATH_demo = os.path.join(IMAGE_PATH, 'demo')
+
+for path in [
+    IMAGE_PATH,
+    IMAGE_PATH_cover,
+    IMAGE_PATH_secret,
+    IMAGE_PATH_steg,
+    IMAGE_PATH_secret_rev,
+    IMAGE_PATH_temp,
+    IMAGE_PATH_fuse,
+    IMAGE_PATH_demo,
+]:
+    os.makedirs(path, exist_ok=True)
+
 suffix = 'model_checkpoint_01500.pt'
 tain_next = True
 trained_epoch = 0

@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+import unittest
+
+import numpy as np
+
+from omniguard.metrics import bit_accuracy, mask_dice, mask_iou, mse, psnr
+
+
+class MetricsTests(unittest.TestCase):
+    def test_basic_image_metrics(self) -> None:
+        image_a = np.zeros((16, 16, 3), dtype=np.uint8)
+        image_b = np.ones((16, 16, 3), dtype=np.uint8) * 10
+        self.assertEqual(mse(image_a, image_a), 0.0)
+        self.assertEqual(psnr(image_a, image_a), 100.0)
+        self.assertGreater(mse(image_a, image_b), 0.0)
+        self.assertLess(psnr(image_a, image_b), 100.0)
+
+    def test_mask_metrics(self) -> None:
+        mask_a = np.zeros((8, 8), dtype=np.uint8)
+        mask_b = np.zeros((8, 8), dtype=np.uint8)
+        mask_a[2:4, 2:4] = 255
+        mask_b[2:4, 2:4] = 255
+        self.assertEqual(mask_iou(mask_a, mask_b), 1.0)
+        self.assertEqual(mask_dice(mask_a, mask_b), 1.0)
+
+    def test_bit_accuracy(self) -> None:
+        self.assertEqual(bit_accuracy([1, 0, 1], [1, 0, 1]), 1.0)
+        self.assertEqual(bit_accuracy([1, 0, 1], [0, 0, 1]), 2 / 3)
+
+
+if __name__ == "__main__":
+    unittest.main()

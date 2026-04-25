@@ -1,96 +1,75 @@
-from os.path import join
+from __future__ import annotations
 
-from scipy.ndimage import zoom
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 
 import config as c
-import datasets
 
-n_imgs = 4
-n_plots = 2
-figsize = (4,4)
 
 class Visualizer:
     def __init__(self, loss_labels):
-            self.n_losses = len(loss_labels)
-            self.loss_labels = loss_labels
-            self.counter = 1
-
-            header = 'Epoch'
-            for l in loss_labels:
-                header += '\t\t%s' % (l)
-
-            self.config_str = ""
-            self.config_str += "==="*30 + "\n"
-            self.config_str += "Config options:\n\n"
-
-            for v in dir(c):
-                if v[0]=='_': continue
-                s=eval('c.%s'%(v))
-                self.config_str += "  {:25}\t{}\n".format(v,s)
-
-            self.config_str += "==="*30 + "\n"
-
-            print(self.config_str)
-            print(header)
+        self.loss_labels = list(loss_labels)
+        self.counter = 1
+        self.output_dir = Path(getattr(c, "IMAGE_PATH_demo", "runtime/demo"))
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def update_losses(self, losses, *args):
-        print('\r', '    '*20, end='')
-        line = '\r%.3i' % (self.counter)
-        for l in losses:
-            line += '\t\t%.4f' % (l)
-
+        line = f"{self.counter:03d}"
+        for loss in losses:
+            line += f"\t{float(loss):.4f}"
         print(line)
         self.counter += 1
 
     def update_images(self, *img_list):
-        w = img_list[0].shape[2]
-        k = 0
-        k_img = 0
+        if not img_list:
+            return None
+        panels = []
+        for image in img_list:
+            array = np.asarray(image)
+            if array.ndim == 3 and array.shape[0] in {1, 3}:
+                array = np.transpose(array, (1, 2, 0))
+            array = np.clip(array, 0.0, 1.0)
+            panels.append(array)
+        canvas = np.concatenate(panels, axis=1)
+        path = self.output_dir / f"{self.counter:04d}.png"
+        plt.imsave(path, canvas)
+        return canvas
 
-        show_img = np.zeros((3, w*n_imgs, w*n_imgs), dtype=np.uint8)
-        img_list_np = []
-        for im in img_list:
-            im_np = im
-            img_list_np.append(np.clip((255. * im_np), 0, 255).astype(np.uint8))
+    def update_hist(self, data):
+        return np.asarray(data)
 
-        for i in range(n_imgs):
-            for j in range(n_imgs):
-                show_img[:, w*i:w*i+w, w*j:w*j+w] = img_list_np[k]
+    def update_running(self, running):
+        print(f"running={bool(running)}")
 
-                k += 1
-                if k >= len(img_list_np):
-                    k = 0
-                    k_img += 1
-
-        plt.imsave(join(c.img_folder, '%.4d.jpg'%(self.counter)), show_img.transpose(1,2,0))
-        return zoom(show_img, (1., c.preview_upscale, c.preview_upscale), order=0)
-
-    def update_hist(self, *args):
-        pass
-
-    def update_running(self, *args):
-        pass
+    def close(self):
+        plt.close("all")
 
 
 visualizer = Visualizer(c.loss_names)
 
+
 def show_loss(losses, logscale=False):
+    del logscale
     visualizer.update_losses(losses)
 
+
 def show_imgs(*imgs):
-    visualizer.update_images(*imgs)
+    return visualizer.update_images(*imgs)
+
 
 def show_hist(data):
-    visualizer.update_hist(data.data)
+    return visualizer.update_hist(data)
+
 
 def signal_start():
     visualizer.update_running(True)
 
+
 def signal_stop():
     visualizer.update_running(False)
 
+
 def close():
     visualizer.close()
-
