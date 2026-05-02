@@ -9,7 +9,9 @@ import numpy as np
 
 from . import attacks
 from .metrics import (
+    ber,
     bit_accuracy,
+    bpp,
     mae,
     mask_dice,
     mask_f1,
@@ -28,14 +30,8 @@ from .service import OmniGuardEngine
 AttackCallable = Callable[[np.ndarray], attacks.AttackOutput]
 
 
-DEFAULT_ATTACKS: tuple[tuple[str, AttackCallable], ...] = (
-    ("identity", attacks.identity),
-    ("jpeg_q70", lambda image: attacks.jpeg_roundtrip(image, quality=70)),
-    ("gaussian_blur", lambda image: attacks.gaussian_blur(image, radius=1.5)),
-    ("resize_065", lambda image: attacks.resize_roundtrip(image, scale=0.65)),
-    ("brightness_115", lambda image: attacks.adjust_brightness(image, factor=1.15)),
-    ("copy_move", attacks.copy_move),
-    ("rect_inpaint", attacks.rectangular_inpaint),
+DEFAULT_ATTACKS: tuple[tuple[str, AttackCallable], ...] = tuple(
+    (name, attack_fn) for name, _, attack_fn in attacks.REQUIREMENT_ATTACKS
 )
 
 
@@ -90,6 +86,11 @@ class BenchmarkRunner:
                 "rmse_protected_vs_attacked": rmse(protected, attacked.image),
                 "psnr_protected_vs_attacked": psnr(protected, attacked.image),
                 "ssim_protected_vs_attacked": ssim(protected, attacked.image),
+                "payload_bpp": bpp(len(protection.payload.encoded_bits), protected),
+                "payload_ber": ber(
+                    protection.payload.encoded_bits,
+                    analysis.payload.decoded_bits,
+                ),
                 "payload_bit_accuracy": bit_accuracy(
                     protection.payload.encoded_bits,
                     analysis.payload.decoded_bits,

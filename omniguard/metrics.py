@@ -35,12 +35,57 @@ def psnr(image_a: np.ndarray, image_b: np.ndarray) -> float:
     return float(10.0 * math.log10((255.0**2) / error))
 
 
+def _global_ssim_fallback(image_a: np.ndarray, image_b: np.ndarray) -> float:
+    image_a = image_a.astype(np.float64)
+    image_b = image_b.astype(np.float64)
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    scores: list[float] = []
+    for channel in range(3):
+        x = image_a[..., channel]
+        y = image_b[..., channel]
+        mu_x = float(x.mean())
+        mu_y = float(y.mean())
+        sigma_x = float(((x - mu_x) ** 2).mean())
+        sigma_y = float(((y - mu_y) ** 2).mean())
+        sigma_xy = float(((x - mu_x) * (y - mu_y)).mean())
+        numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+        denominator = (mu_x**2 + mu_y**2 + c1) * (sigma_x + sigma_y + c2)
+        scores.append(numerator / denominator if denominator != 0 else 1.0)
+    return float(np.clip(np.mean(scores), -1.0, 1.0))
+
+
 def ssim(image_a: np.ndarray, image_b: np.ndarray) -> float | None:
-    if _skimage_ssim is None:
-        return None
     image_a = ensure_rgb_uint8(image_a)
     image_b = ensure_rgb_uint8(image_b)
-    return float(_skimage_ssim(image_a, image_b, channel_axis=2, data_range=255))
+    if _skimage_ssim is not None and min(image_a.shape[:2]) >= 7 and min(image_b.shape[:2]) >= 7:
+        try:
+            return float(_skimage_ssim(image_a, image_b, channel_axis=2, data_range=255))
+        except ValueError:
+            pass
+    return _global_ssim_fallback(image_a, image_b)
+
+
+def bpp(payload_bits: int, image: np.ndarray) -> float:
+    """Bits per pixel: how many watermark bits are embedded per image pixel."""
+    source = ensure_rgb_uint8(image)
+    height, width = source.shape[:2]
+    if height == 0 or width == 0:
+        return 0.0
+    return float(payload_bits / (height * width))
+
+
+def ber(reference_bits: list[int], extracted_bits: list[int]) -> float | None:
+    """Bit error rate: fraction of watermark bits changed after an attack."""
+    if not reference_bits or not extracted_bits:
+        return None
+    shared = min(len(reference_bits), len(extracted_bits))
+    errors = sum(
+        int(reference_bits[index] != extracted_bits[index])
+        for index in range(shared)
+    )
+    missing = abs(len(reference_bits) - len(extracted_bits))
+    return float((errors + missing) / max(len(reference_bits), len(extracted_bits)))
 
 
 def changed_pixel_ratio(image_a: np.ndarray, image_b: np.ndarray, threshold: int = 12) -> float:

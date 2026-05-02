@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
+from typing import Any
 
 import gradio as gr
 
-from .benchmark import BenchmarkRunner
+from .attacks import ATTACK_REFERENCE_MARKDOWN
+from .basic_watermarking import METHOD_REFERENCE_MARKDOWN, method_choices
 from .editing import EDITOR_DESCRIPTIONS, EditingResult, editor_choices, editor_help_markdown
 from .image_ops import overlay_mask
-from .schemas import AnalysisResult, AttackResult, ProtectionResult
+from .requirement_experiments import RequirementExperimentRunner
+from .schemas import AnalysisResult, ProtectionResult
 from .service import OmniGuardEngine
 
 
@@ -21,11 +25,20 @@ CUSTOM_CSS = """
   margin-bottom: 8px;
 }
 
+.og-note {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f5f8fc;
+  border: 1px solid #d9e3f0;
+  margin: 8px 0 12px 0;
+  font-size: 14px;
+}
+
 .og-section {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin: 4px 0 8px 0;
+  margin: 8px 0 6px 0;
   font-size: 20px;
   font-weight: 700;
 }
@@ -51,33 +64,151 @@ CUSTOM_CSS = """
   user-select: none;
 }
 
-.og-note {
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: #f5f8fc;
-  border: 1px solid #d9e3f0;
-  margin-bottom: 12px;
+.og-theme-links {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0 2px 0;
+  color: #4b5563;
   font-size: 14px;
+}
+
+.og-theme-links a {
+  color: #1f5fbf;
+  text-decoration: none;
+  border: 1px solid #c9d7ef;
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: #ffffff;
+}
+
+.og-theme-links a:hover {
+  background: #eef5ff;
 }
 """
 
-BENCHMARK_COLUMNS = (
-    ("Атака", "attack_name"),
-    ("Payload: подпись OK", "payload_auth_ok"),
-    ("Payload: document_id совпал", "payload_document_match"),
-    ("Точность бит payload", "payload_bit_accuracy"),
-    ("PSNR", "psnr_protected_vs_attacked"),
-    ("SSIM", "ssim_protected_vs_attacked"),
-    ("Макс. tamper score", "tamper_score_max"),
-    ("Доля маски", "tamper_ratio"),
-    ("IoU", "mask_iou"),
-    ("Dice", "mask_dice"),
-)
-BENCHMARK_HEADERS = [title for title, _ in BENCHMARK_COLUMNS]
-ANALYSIS_METRIC_HEADERS = ["Метрика", "Значение", "Что это значит"]
+
+ANALYSIS_METRIC_HEADERS = ["Метрика", "Значение", "Что показывает"]
+METHOD_METRIC_HEADERS = ["Метрика", "Значение", "Как читать"]
+REQUIREMENT_BENCHMARK_HEADERS = ["Изображение", "Метод", "Атака", "PSNR", "SSIM", "bpp", "BER", "Статус"]
 
 
-def _json_dump(data: dict) -> str:
+METRIC_REFERENCE_MARKDOWN = """
+# Метрики из требований
+
+В требованиях используются четыре основные метрики: `PSNR`, `SSIM`, `bpp` и `BER`.
+
+## PSNR
+
+`PSNR` показывает, насколько изображение после встраивания похоже на исходное. Чем выше значение, тем менее заметен водяной знак.
+
+Формулы:
+
+`MSE = (1 / (H * W * C)) * sum((I(i,j,c) - Iw(i,j,c))^2)`
+
+`PSNR = 10 * log10(MAX_I^2 / MSE)`
+
+где `I` — исходное изображение, `Iw` — изображение с ЦВЗ, `H` и `W` — высота и ширина, `C` — число каналов, `MAX_I = 255`.
+
+## SSIM
+
+`SSIM` оценивает структурное сходство изображений. Значение ближе к `1` означает, что структура изображения почти не изменилась.
+
+Формула:
+
+`SSIM(x, y) = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / ((mu_x^2 + mu_y^2 + C1) * (sigma_x^2 + sigma_y^2 + C2))`
+
+где `mu` — средняя яркость, `sigma` — дисперсия, `sigma_xy` — ковариация.
+
+## bpp
+
+`bpp` — bits per pixel, то есть сколько бит ЦВЗ приходится на один пиксель изображения.
+
+Формула:
+
+`bpp = N_bits / (H * W)`
+
+где `N_bits` — число встроенных бит, `H * W` — количество пикселей.
+
+## BER
+
+`BER` — bit error rate. Метрика показывает, какая доля бит ЦВЗ была извлечена неправильно после атаки.
+
+Формула:
+
+`BER = N_error / N_bits`
+
+где `N_error` — количество несовпавших бит между исходным и извлеченным ЦВЗ.
+
+Интерпретация:
+
+- `BER = 0` — все биты восстановлены правильно.
+- `BER = 0.1` — 10% бит повреждены.
+- `BER` около `0.5` — извлечение почти случайное.
+"""
+
+
+INTERFACE_REFERENCE_MARKDOWN = """
+# Разделы интерфейса
+
+## Основной сценарий
+
+Используется для полного рабочего цикла OmniGuard: загрузка изображения, встраивание payload, локальное редактирование и анализ изменений.
+
+## Методы встраивания ЦВЗ
+
+Раздел показывает базовые алгоритмы из требований: OmniGuard, LSB и DCT. Здесь можно встроить текстовый payload в одно изображение и сразу увидеть `PSNR`, `SSIM`, `bpp` и `BER` без атаки.
+
+## Пакетный benchmark
+
+Раздел принимает много изображений, встраивает ЦВЗ выбранными методами, применяет атаки из требований и считает метрики.
+
+## Анализ внешнего файла
+
+Нужен, если защищенное изображение было изменено вручную во внешнем редакторе. Сюда загружается измененная версия и, желательно, защищенная опорная версия.
+
+## Справочник
+
+Внутри собраны объяснения методов, атак, метрик и интерпретации анализа.
+"""
+
+
+ANALYSIS_REFERENCE_MARKDOWN = """
+# Как читать результат анализа
+
+Раздел анализа отвечает на два вопроса:
+
+1. удалось ли корректно извлечь payload;
+2. есть ли локальные области, похожие на изменение изображения.
+
+## Payload
+
+`payload_auth_ok` показывает, прошла ли HMAC-проверка встроенного payload. Если значение `нет`, значит извлеченные биты не согласуются с контрольной подписью.
+
+`payload_document_match` показывает, совпал ли hash извлеченного `document_id` с ожидаемым `document_id`, который ввел пользователь.
+
+`payload_corrected_errors` показывает, сколько одиночных битовых ошибок исправил Hamming-декодер.
+
+## Heatmap
+
+`Heatmap` — это карта подозрительности. Чем ярче пиксель, тем сильнее локальное отклонение.
+
+В режиме `watermark` карта строится по нарушению скрытого watermark. В режиме `reference` карта строится по различию между текущим изображением и защищенной опорной версией. В режиме `hybrid` используются оба источника.
+
+## Бинарная маска
+
+Бинарная маска получается из heatmap по порогу. Все пиксели выше порога считаются подозрительными, остальные отбрасываются.
+
+## Практическая интерпретация
+
+- если `payload_auth_ok = нет`, встроенные данные повреждены или извлечены некорректно;
+- если `payload_document_match = нет`, изображение не соответствует ожидаемому `document_id`;
+- если `tamper_ratio` заметно больше нуля, система нашла область подозрительных пикселей;
+- если `changed_pixel_ratio_vs_reference` заметно больше нуля, изображение отличается от опорной защищенной версии.
+"""
+
+
+def _json_dump(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
@@ -89,25 +220,20 @@ def _logo_html(logo_path: Path) -> str:
         "<div class='og-title'>"
         f"<img src='data:image/png;base64,{encoded}' alt='Logo' style='height:56px;'>"
         "<div><div style='font-size:34px;font-weight:700;'>OmniGuard 2.0</div>"
-        "<div style='font-size:15px;'>Защита изображения, локализация изменений и проверка payload</div></div>"
+        "<div style='font-size:15px;'>ЦВЗ, payload, атаки, метрики и пакетные эксперименты</div></div>"
         "</div>"
     )
 
 
-def _format_metric(value):
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "да" if value else "нет"
-    if isinstance(value, float):
-        return round(value, 4)
-    return value
-
-
-def _doc_markdown(path: Path, fallback: str) -> str:
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    return fallback
+def _theme_links_html() -> str:
+    return (
+        "<div class='og-theme-links'>"
+        "<span>Тема интерфейса:</span>"
+        "<a href='?__theme=light'>Светлая</a>"
+        "<a href='?__theme=system'>Авто</a>"
+        "<a href='?__theme=dark'>Темная</a>"
+        "</div>"
+    )
 
 
 def _tooltip_icon(text: str) -> str:
@@ -124,26 +250,34 @@ def _note_block(text: str) -> str:
     return f"<div class='og-note'>{text}</div>"
 
 
-def _protect_summary(result: ProtectionResult) -> dict:
-    summary = {
-        "что_сделано": "В изображение встроены tamper-sensitive watermark и 100-битный payload.",
-        "зачем_document_id": "document_id хешируется и встраивается в payload, чтобы потом проверить принадлежность изображения.",
-        "что_делать_дальше": "После защиты можно либо сразу анализировать изображение, либо изменить выделенную область и проверить реакцию системы.",
-    }
-    summary.update(result.to_dict())
+def _format_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "да" if value else "нет"
+    if isinstance(value, float):
+        return round(value, 6)
+    return value
+
+
+def _doc_markdown(path: Path, fallback: str) -> str:
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return fallback
+
+
+def _protect_summary(result: ProtectionResult) -> dict[str, Any]:
+    summary = result.to_dict()
+    summary["что_сделано"] = "В изображение встроены tamper-sensitive watermark и 100-битный payload."
     summary["payload"]["record"]["issued_at_utc"] = result.payload.record.issued_at_utc.isoformat()
     return summary
 
 
-def _edit_summary(result: EditingResult) -> dict:
-    backend_note = EDITOR_DESCRIPTIONS.get(
-        result.backend_name,
-        "Использован backend редактирования без дополнительного описания.",
-    )
+def _edit_summary(result: EditingResult) -> dict[str, Any]:
     return {
         "editor_backend": result.backend_name,
         "editor_backend_label": result.backend_label,
-        "что_это_значит": backend_note,
+        "описание": EDITOR_DESCRIPTIONS.get(result.backend_name, ""),
         "prompt": result.prompt,
         "model_id": result.model_id,
         "num_inference_steps": result.num_inference_steps,
@@ -155,173 +289,160 @@ def _edit_summary(result: EditingResult) -> dict:
 def _analysis_verdict(result: AnalysisResult) -> tuple[str, list[str]]:
     reasons: list[str] = []
     if not result.payload.auth_ok:
-        reasons.append("контрольная подпись payload не сошлась")
+        reasons.append("контрольная подпись payload не прошла проверку")
     if result.payload.document_match is False:
-        reasons.append("встроенный document_id не совпал с ожидаемым")
+        reasons.append("извлеченный document_id не совпал с ожидаемым")
     if result.tamper_ratio >= 0.02:
-        reasons.append("маска покрывает заметную область изображения")
-    if result.tamper_score_max >= 0.55 or (
-        result.tamper_score_max >= 0.35
-        and (
-            result.tamper_ratio >= 0.005
-            or result.comparison_metrics.get("changed_pixel_ratio_vs_reference", 0.0) >= 0.005
-        )
-    ):
-        reasons.append("локальный tamper score высокий")
+        reasons.append("подозрительная маска занимает заметную часть изображения")
     if result.comparison_metrics.get("changed_pixel_ratio_vs_reference", 0.0) >= 0.01:
-        reasons.append("по сравнению с опорной версией изменилось заметное число пикселей")
+        reasons.append("изображение заметно отличается от защищенной опорной версии")
+    if result.tamper_score_max >= 0.55:
+        reasons.append("найдена сильная локальная аномалия watermark")
 
     if reasons:
         return "Вероятно, изображение было изменено.", reasons
-
-    weak_reasons: list[str] = []
-    if result.tamper_ratio >= 0.005:
-        weak_reasons.append("есть небольшая подозрительная область")
-    if result.tamper_score_max >= 0.2:
-        weak_reasons.append("локальный tamper score выше фонового уровня")
-    if weak_reasons:
-        return "Есть слабые признаки локального изменения, но без уверенного вывода.", weak_reasons
-
+    if result.tamper_ratio >= 0.005 or result.tamper_score_max >= 0.2:
+        return "Есть слабые признаки локального изменения.", [
+            "аномалии есть, но они недостаточно сильные для уверенного вывода"
+        ]
     return "Сильных признаков изменения не обнаружено.", [
-        "payload проходит проверку",
-        "выраженных аномальных областей не найдено",
+        "payload и карта аномалий не показывают выраженного вмешательства"
     ]
 
 
 def _analysis_markdown(result: AnalysisResult) -> str:
     verdict, reasons = _analysis_verdict(result)
-    payload = result.payload
     reason_lines = "\n".join(f"- {reason}" for reason in reasons)
-    document_match = "не проверялось" if payload.document_match is None else ("да" if payload.document_match else "нет")
-    warnings = "\n".join(f"- {warning}" for warning in payload.warnings) if payload.warnings else "- предупреждений нет"
-    mode = result.metadata.get("analysis_mode", "hybrid")
-    reference_used = "да" if result.metadata.get("reference_image_used") else "нет"
+    document_match = (
+        "не проверялось"
+        if result.payload.document_match is None
+        else ("да" if result.payload.document_match else "нет")
+    )
     return (
         f"**Вердикт:** {verdict}\n\n"
-        f"**Почему система так считает:**\n{reason_lines}\n\n"
-        f"**Режим анализа:** `{mode}`\n"
-        f"**Использована защищенная опорная версия:** {reference_used}\n\n"
-        f"**Ключевые сигналы:**\n"
-        f"- `payload.auth_ok`: {'да' if payload.auth_ok else 'нет'}\n"
-        f"- `payload.document_match`: {document_match}\n"
-        f"- `payload.corrected_errors`: {payload.corrected_errors}\n"
-        f"- `tamper_score_mean`: {result.tamper_score_mean:.4f}\n"
-        f"- `tamper_score_max`: {result.tamper_score_max:.4f}\n"
-        f"- `tamper_ratio`: {result.tamper_ratio:.4f}\n\n"
-        f"**Как читать визуализацию:**\n"
-        f"- `Heatmap` показывает силу аномалии по пикселям.\n"
-        f"- `Бинарная маска` содержит только пиксели выше порога.\n"
-        f"- Если доступна защищенная опорная версия, локализация становится заметно точнее.\n\n"
-        f"**Предупреждения декодера:**\n{warnings}"
+        f"**Почему:**\n{reason_lines}\n\n"
+        f"**Payload:**\n"
+        f"- подпись payload OK: {'да' if result.payload.auth_ok else 'нет'}\n"
+        f"- document_id совпал: {document_match}\n"
+        f"- исправлено ошибок Hamming: {result.payload.corrected_errors}\n\n"
+        f"**Локализация:**\n"
+        f"- средний tamper score: `{result.tamper_score_mean:.4f}`\n"
+        f"- максимальный tamper score: `{result.tamper_score_max:.4f}`\n"
+        f"- доля бинарной маски: `{result.tamper_ratio:.4f}`"
     )
 
 
-def _analysis_report(result: AnalysisResult) -> dict:
-    summary = result.to_dict()
+def _analysis_report(result: AnalysisResult) -> dict[str, Any]:
+    report = result.to_dict()
     if result.payload.record is not None:
-        summary["payload"]["record"]["issued_at_utc"] = result.payload.record.issued_at_utc.isoformat()
-    summary["как_читать"] = {
-        "tamper_score_mean": "Среднее значение карты аномалий по всему изображению.",
-        "tamper_score_max": "Максимальная локальная аномалия. Особенно полезна для небольшой правки.",
-        "tamper_ratio": "Доля пикселей, попавших в бинарную маску.",
-        "payload.auth_ok": "Проверка HMAC-тега встроенного payload.",
-        "payload.document_match": "Совпадение decoded document_id hash с ожидаемым document_id.",
-        "comparison_metrics": "Дополнительные метрики сравнения с защищенной опорной версией.",
+        report["payload"]["record"]["issued_at_utc"] = result.payload.record.issued_at_utc.isoformat()
+    report["как_читать"] = {
+        "payload.auth_ok": "показывает, прошла ли HMAC-проверка payload",
+        "payload.document_match": "показывает, совпал ли document_id с ожидаемым",
+        "tamper_score_max": "самая сильная локальная аномалия",
+        "tamper_ratio": "доля пикселей, попавших в бинарную маску",
     }
-    return summary
+    return report
 
 
-def _analysis_metrics_rows(result: AnalysisResult) -> list[list[object]]:
+def _analysis_metrics_rows(result: AnalysisResult) -> list[list[Any]]:
     rows = [
-        ["payload_auth_ok", "да" if result.payload.auth_ok else "нет", "Прошла ли встроенная подпись payload проверку"],
+        ["payload_auth_ok", "да" if result.payload.auth_ok else "нет", "Целостность извлеченного payload"],
         [
             "payload_document_match",
             "не проверялось" if result.payload.document_match is None else ("да" if result.payload.document_match else "нет"),
-            "Совпал ли восстановленный document_id с ожидаемым",
+            "Совпадение ожидаемого document_id",
         ],
-        ["payload_corrected_errors", result.payload.corrected_errors, "Сколько ошибок исправил Hamming-декодер"],
-        ["tamper_score_mean", round(result.tamper_score_mean, 4), "Средняя аномалия по всему изображению"],
-        ["tamper_score_max", round(result.tamper_score_max, 4), "Самая сильная локальная аномалия"],
-        ["tamper_ratio", round(result.tamper_ratio, 4), "Доля пикселей в итоговой подозрительной маске"],
+        ["tamper_score_mean", round(result.tamper_score_mean, 6), "Средняя сила аномалии по изображению"],
+        ["tamper_score_max", round(result.tamper_score_max, 6), "Самая сильная локальная аномалия"],
+        ["tamper_ratio", round(result.tamper_ratio, 6), "Доля пикселей в бинарной маске"],
     ]
-    comparison_descriptions = {
-        "mse_vs_reference": "Средняя квадратичная ошибка между текущим и защищенным изображением",
-        "mae_vs_reference": "Среднее абсолютное отличие пикселей",
-        "rmse_vs_reference": "Корень из средней квадратичной ошибки",
-        "psnr_vs_reference": "Похожесть изображений по отношению сигнал/шум",
-        "ssim_vs_reference": "Структурное сходство изображений",
-        "changed_pixel_ratio_vs_reference": "Какая доля пикселей заметно изменилась относительно защищенной версии",
-    }
     for key, value in result.comparison_metrics.items():
-        rows.append([key, _format_metric(value), comparison_descriptions.get(key, "Дополнительная метрика сравнения")])
+        rows.append([key, _format_value(value), "Сравнение с защищенной опорной версией"])
     return rows
 
 
-def _benchmark_summary(results: list[AttackResult], report_path: Path) -> str:
-    payload_fail = [
-        result.attack_name for result in results if result.metrics.get("payload_auth_ok") is False
+def _method_metric_rows(metrics: dict[str, Any], metadata: dict[str, Any]) -> list[list[Any]]:
+    return [
+        ["PSNR", _format_value(metrics.get("psnr")), "Чем выше, тем менее заметен ЦВЗ"],
+        ["SSIM", _format_value(metrics.get("ssim")), "Чем ближе к 1, тем больше структурное сходство"],
+        ["bpp", _format_value(metrics.get("bpp")), "Сколько бит ЦВЗ приходится на один пиксель"],
+        ["BER без атаки", _format_value(metadata.get("clean_ber")), "Доля ошибочных бит сразу после извлечения"],
+        ["Встроено бит", metadata.get("embedded_bits"), "Размер встроенного payload"],
     ]
-    document_fail = [
-        result.attack_name for result in results if result.metrics.get("payload_document_match") is False
-    ]
-    strong_localization = [
-        result.attack_name for result in results if (result.metrics.get("tamper_ratio") or 0.0) >= 0.02
-    ]
+
+
+def _benchmark_rows_for_table(rows: list[dict[str, Any]], limit: int = 500) -> list[list[Any]]:
+    table: list[list[Any]] = []
+    for row in rows[:limit]:
+        table.append(
+            [
+                row.get("image", ""),
+                row.get("method", ""),
+                row.get("attack", ""),
+                _format_value(row.get("psnr")),
+                _format_value(row.get("ssim")),
+                _format_value(row.get("bpp")),
+                _format_value(row.get("ber")),
+                row.get("status", ""),
+            ]
+        )
+    return table
+
+
+def _benchmark_summary(rows: list[dict[str, Any]], report_path: Path) -> str:
+    ok_rows = [row for row in rows if row.get("status") == "ok"]
+    error_rows = [row for row in rows if row.get("status") != "ok"]
+    avg_ber_by_method: dict[str, list[float]] = {}
+    for row in ok_rows:
+        value = row.get("ber")
+        if isinstance(value, (int, float)):
+            avg_ber_by_method.setdefault(str(row.get("method")), []).append(float(value))
+    method_lines = []
+    for method, values in avg_ber_by_method.items():
+        avg = sum(values) / len(values) if values else 0.0
+        method_lines.append(f"- `{method}`: средний BER = `{avg:.4f}`")
+    method_block = "\n".join(method_lines) if method_lines else "- нет успешных строк"
     return (
-        "**Как читать benchmark:**\n"
-        "- `Payload: подпись OK` показывает, пережил ли payload атаку без потери целостности.\n"
-        "- `Payload: document_id совпал` показывает, совпал ли извлеченный идентификатор с ожидаемым.\n"
-        "- `PSNR` и `SSIM` описывают визуальную близость атакованного изображения к защищенному.\n"
-        "- `Макс. tamper score` показывает силу самой заметной локальной аномалии.\n"
-        "- `IoU` и `Dice` считаются только там, где у атаки есть известная эталонная маска правки.\n\n"
-        f"**Краткий итог текущего прогона:**\n"
-        f"- атаки, где сломалась подпись payload: {', '.join(payload_fail) if payload_fail else 'нет'}\n"
-        f"- атаки, где не совпал document_id: {', '.join(document_fail) if document_fail else 'нет'}\n"
-        f"- атаки с заметной локализацией правок: {', '.join(strong_localization) if strong_localization else 'нет'}\n"
-        f"- JSON-отчет сохранен в: `{report_path}`"
+        f"**Готово.** Обработано строк эксперимента: `{len(rows)}`.\n\n"
+        f"**Ошибок:** `{len(error_rows)}`.\n\n"
+        f"**Средний BER по методам:**\n{method_block}\n\n"
+        f"**CSV-отчет:** `{report_path}`\n\n"
+        "В таблице показаны только первые 500 строк, полный результат сохранен в CSV."
     )
 
 
 def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
     engine = engine or OmniGuardEngine()
-    benchmark_runner = BenchmarkRunner(engine)
+    requirement_runner = RequirementExperimentRunner(engine)
 
-    interface_guide_md = _doc_markdown(
-        engine.settings.docs_dir / "INTERFACE_GUIDE.md",
-        "# Справка по интерфейсу\n\nФайл `docs/INTERFACE_GUIDE.md` не найден.",
+    requirement_guide_md = _doc_markdown(
+        engine.settings.docs_dir / "REQUIREMENTS_ATTACKS_METRICS_METHODS.md",
+        "# Методология по требованиям\n\nФайл справки не найден.",
     )
-    metrics_reference_md = _doc_markdown(
-        engine.settings.docs_dir / "METRICS_REFERENCE.md",
-        "# Метрики и формулы\n\nФайл `docs/METRICS_REFERENCE.md` не найден.",
-    )
-    analysis_interpretation_md = _doc_markdown(
-        engine.settings.docs_dir / "ANALYSIS_INTERPRETATION.md",
-        "# Как интерпретировать результат анализа\n\nФайл `docs/ANALYSIS_INTERPRETATION.md` не найден.",
-    )
-    user_guide_md = _doc_markdown(
-        engine.settings.docs_dir / "USER_GUIDE.md",
-        "# Подробный гайд\n\nФайл `docs/USER_GUIDE.md` не найден.",
+    technical_pipeline_md = _doc_markdown(
+        engine.settings.docs_dir / "PIPELINE_METRICS_HEATMAP_DEEP_DIVE.md",
+        "# Пайплайн, метрики и heatmap\n\nФайл справки не найден.",
     )
 
     def protect_ui(image, document_id):
         if image is None:
             raise gr.Error("Загрузите изображение для защиты.")
         if not document_id.strip():
-            raise gr.Error("Укажите document_id для встраивания payload.")
-        clean_document_id = document_id.strip()
-        result = engine.protect_image(image, clean_document_id)
+            raise gr.Error("Укажите document_id.")
+        result = engine.protect_image(image, document_id.strip())
         return (
             result.protected_image,
             result.protected_image,
             result.protected_image,
-            clean_document_id,
+            document_id.strip(),
             _json_dump(_protect_summary(result)),
             result.payload.encoded_bits,
         )
 
     def edit_ui(sketch_data, prompt, editor_name, editor_model_id, allow_download):
         if sketch_data is None or sketch_data.get("image") is None:
-            raise gr.Error("Подайте защищенное изображение в редактор.")
+            raise gr.Error("Сначала защитите изображение или передайте его в редактор.")
         if sketch_data.get("mask") is None:
             raise gr.Error("Нарисуйте маску области редактирования.")
         try:
@@ -334,10 +455,7 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                 allow_download=allow_download,
             )
         except Exception as exc:
-            raise gr.Error(
-                "Не удалось выполнить редактирование выбранным backend. "
-                "Проверьте доступность модели или переключитесь на OpenCV."
-            ) from exc
+            raise gr.Error("Не удалось выполнить редактирование. Попробуйте OpenCV-редактор.") from exc
         return result.image, _json_dump(_edit_summary(result))
 
     def analyze_ui(image, expected_document_id, reference_bits, protected_reference, analysis_mode, threshold):
@@ -351,17 +469,19 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
             analysis_mode=analysis_mode,
             threshold_override=float(threshold),
         )
-        overlay = overlay_mask(image, result.tamper_heatmap)
-        report = _analysis_report(result)
-        explanation = _analysis_markdown(result)
-        rows = _analysis_metrics_rows(result)
-        return overlay, result.binary_mask, _json_dump(report), explanation, rows
+        return (
+            overlay_mask(image, result.tamper_heatmap),
+            result.binary_mask,
+            _json_dump(_analysis_report(result)),
+            _analysis_markdown(result),
+            _analysis_metrics_rows(result),
+        )
 
     def analyze_external_ui(external_image, protected_reference, expected_document_id, analysis_mode, threshold):
         if external_image is None:
-            raise gr.Error("Загрузите внешне измененное изображение для анализа.")
+            raise gr.Error("Загрузите внешне измененное изображение.")
         if analysis_mode == "reference" and protected_reference is None:
-            raise gr.Error("Для режима 'Только сравнение с опорной версией' нужно загрузить защищенную опорную версию.")
+            raise gr.Error("Для режима сравнения нужна защищенная опорная версия.")
         result = engine.analyze_image(
             external_image,
             expected_document_id=expected_document_id.strip() or None,
@@ -369,112 +489,116 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
             analysis_mode=analysis_mode,
             threshold_override=float(threshold),
         )
-        overlay = overlay_mask(external_image, result.tamper_heatmap)
-        report = _analysis_report(result)
-        explanation = _analysis_markdown(result)
-        rows = _analysis_metrics_rows(result)
-        return overlay, result.binary_mask, _json_dump(report), explanation, rows
+        return (
+            overlay_mask(external_image, result.tamper_heatmap),
+            result.binary_mask,
+            _json_dump(_analysis_report(result)),
+            _analysis_markdown(result),
+            _analysis_metrics_rows(result),
+        )
 
-    def benchmark_ui(image, document_id):
+    def method_demo_ui(image, payload_text, method_id):
         if image is None:
-            raise gr.Error("Загрузите изображение для benchmark.")
-        if not document_id.strip():
-            raise gr.Error("Укажите document_id.")
-        results, report_path = benchmark_runner.run(image, document_id.strip())
-        rows = []
-        for result in results:
-            row = []
-            for _, key in BENCHMARK_COLUMNS:
-                if key == "attack_name":
-                    row.append(result.attack_name)
-                else:
-                    row.append(_format_metric(result.metrics.get(key)))
-            rows.append(row)
-        return rows, str(report_path), _benchmark_summary(results, report_path)
+            raise gr.Error("Загрузите изображение.")
+        if not payload_text.strip():
+            raise gr.Error("Введите текст payload / document_id для встраивания.")
+        bundle, explanation = requirement_runner.run_single(image, payload_text.strip(), method_id)
+        return (
+            bundle.watermarked_image,
+            _method_metric_rows(bundle.metrics, bundle.metadata),
+            _json_dump(
+                {
+                    "method": bundle.method_name,
+                    "metadata": bundle.metadata,
+                    "payload_bits_preview": bundle.payload_bits[:64],
+                    "payload_bits_total": len(bundle.payload_bits),
+                }
+            ),
+            explanation,
+        )
 
-    with gr.Blocks(title="OmniGuard 2.0", css=CUSTOM_CSS) as demo:
+    def batch_benchmark_ui(uploaded_files, folder_path, payload_text, method_ids):
+        selected_methods = list(method_ids or [])
+        if not selected_methods:
+            raise gr.Error("Выберите хотя бы один метод встраивания.")
+        image_paths = requirement_runner.collect_images(uploaded_files, folder_path)
+        if not image_paths:
+            raise gr.Error("Загрузите изображения или укажите папку с изображениями.")
+        rows, report_path = requirement_runner.run_batch(
+            image_paths=image_paths,
+            payload_text=payload_text.strip() or "omniguard-demo",
+            method_ids=selected_methods,
+        )
+        return _benchmark_rows_for_table(rows), str(report_path), _benchmark_summary(rows, report_path)
+
+    with gr.Blocks(title="OmniGuard 2.0", css=CUSTOM_CSS, theme=gr.themes.Soft()) as demo:
         payload_bits_state = gr.State([])
         gr.HTML(_logo_html(engine.settings.logo_path))
+        gr.HTML(_theme_links_html())
         gr.HTML(
             _note_block(
-                "Наводи курсор на значок <b>?</b> рядом с заголовками разделов — там быстрые подсказки. "
-                "Для самой точной локализации изменений используй гибридный режим: он сравнивает текущую версию с защищенной опорной."
+                "Интерфейс теперь разделен на практические сценарии и один общий справочник. "
+                "Наводи курсор на значок <b>?</b>, чтобы увидеть быстрые подсказки."
             )
         )
+
         with gr.Tabs():
             with gr.TabItem("1. Основной сценарий"):
                 gr.HTML(
                     _section_block(
                         "Шаг 1. Защита изображения",
-                        "На этом шаге изображение получает два скрытых слоя: tamper-sensitive watermark и payload с document_id.",
-                        "Сначала защити изображение. После этого оно автоматически подставится и в редактор, и в анализ.",
+                        "Встраивает в изображение tamper-sensitive watermark и payload с document_id.",
+                        "Используй этот раздел для полного цикла: защита, редактирование, анализ.",
                     )
                 )
                 with gr.Row():
                     with gr.Column():
                         source_image = gr.Image(label="Исходное изображение", type="numpy")
-                        document_id = gr.Textbox(
-                            label="Document ID",
-                            placeholder="diploma-demo-001",
-                        )
+                        document_id = gr.Textbox(label="Document ID", placeholder="diploma-demo-001")
                         protect_button = gr.Button("1. Защитить изображение")
                     with gr.Column():
                         protected_image = gr.Image(label="Защищенное изображение", type="numpy")
-                        protection_json = gr.Textbox(label="Что произошло на шаге защиты", lines=18)
+                        with gr.Accordion("Технический отчет о защите", open=False):
+                            protection_json = gr.Textbox(label="JSON", lines=14)
 
                 gr.HTML(
                     _section_block(
                         "Шаг 2. Локальное редактирование",
-                        "Выдели область кистью. Теперь можно выбрать конкретный редактор: быстрые локальные OpenCV-варианты или более качественные diffusers-режимы.",
-                        "Этот шаг нужен, чтобы смоделировать реальное вмешательство и потом проверить, увидит ли его анализатор.",
+                        "Позволяет искусственно изменить выделенную область и проверить, найдет ли ее анализатор.",
                     )
                 )
                 gr.Markdown(editor_help_markdown())
                 with gr.Row():
                     with gr.Column():
-                        editor_canvas = gr.Image(
-                            label="Выделите область, которую хотите изменить",
-                            type="numpy",
-                            tool="sketch",
-                        )
-                        editor_name = gr.Dropdown(
-                            choices=editor_choices(),
-                            value="auto",
-                            label="Редактор изображения",
-                        )
+                        editor_canvas = gr.Image(label="Выделите область для редактирования", type="numpy", tool="sketch")
+                        editor_name = gr.Dropdown(choices=editor_choices(), value="auto", label="Редактор")
                         editor_model_id = gr.Textbox(
                             label="Локальный путь / model id для diffusers",
                             placeholder=engine.settings.inpaint_model_id,
                         )
                         allow_model_download = gr.Checkbox(
-                            label="Разрешить загрузку модели из интернета, если ее нет локально",
+                            label="Разрешить загрузку diffusers-модели из интернета",
                             value=engine.settings.allow_inpaint_model_download,
                         )
                         prompt = gr.Textbox(
-                            label="Prompt для генеративного редактирования",
+                            label="Prompt для генеративного редактора",
                             placeholder="remove the selected object and fill the area naturally",
                         )
                         edit_button = gr.Button("2. Выполнить редактирование")
                     with gr.Column():
-                        analysis_input_image = gr.Image(
-                            label="Изображение, которое пойдет в анализ",
-                            type="numpy",
-                        )
-                        edit_json = gr.Textbox(label="Что произошло на шаге редактирования", lines=9)
+                        analysis_input_image = gr.Image(label="Изображение для анализа", type="numpy")
+                        with gr.Accordion("Технический отчет о редактировании", open=False):
+                            edit_json = gr.Textbox(label="JSON", lines=9)
 
                 gr.HTML(
                     _section_block(
-                        "Шаг 3. Анализ и локализация изменений",
-                        "Гибридный режим использует и watermark, и сравнение с защищенной опорной версией. Он обычно выделяет локальные изменения заметно точнее.",
-                        "Здесь система извлекает payload, оценивает целостность изображения и строит карту подозрительных областей.",
+                        "Шаг 3. Анализ изменений",
+                        "Извлекает payload, строит heatmap и бинарную маску подозрительных областей.",
                     )
                 )
                 with gr.Row():
                     with gr.Column():
-                        expected_document_id = gr.Textbox(
-                            label="Ожидаемый document_id для проверки",
-                            placeholder="diploma-demo-001",
-                        )
+                        expected_document_id = gr.Textbox(label="Ожидаемый document_id", placeholder="diploma-demo-001")
                         analysis_mode = gr.Radio(
                             choices=[
                                 ("Гибридный: watermark + опорная версия", "hybrid"),
@@ -491,23 +615,19 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                             value=engine.settings.tamper_mask_threshold,
                             label="Порог бинарной маски",
                         )
-                        analyze_button = gr.Button("3. Проанализировать изображение")
+                        analyze_button = gr.Button("3. Проанализировать")
                     with gr.Column():
-                        analysis_overlay = gr.Image(
-                            label="Heatmap, наложенная на изображение",
-                            type="numpy",
-                        )
-                        analysis_mask = gr.Image(
-                            label="Бинарная маска подозрительных областей",
-                            type="numpy",
-                        )
-                        analysis_json = gr.Textbox(label="Технический отчет анализа", lines=18)
+                        analysis_overlay = gr.Image(label="Heatmap поверх изображения", type="numpy")
+                        analysis_mask = gr.Image(label="Бинарная маска изменений", type="numpy")
+                        with gr.Accordion("Технический отчет анализа", open=False):
+                            analysis_json = gr.Textbox(label="JSON", lines=16)
                 analysis_explanation = gr.Markdown()
                 analysis_metrics_table = gr.Dataframe(
                     headers=ANALYSIS_METRIC_HEADERS,
                     value=[["", "", ""]],
-                    label="Ключевые метрики текущего анализа",
+                    label="Ключевые показатели анализа",
                 )
+
                 protect_button.click(
                     protect_ui,
                     inputs=[source_image, document_id],
@@ -543,60 +663,90 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                         analysis_metrics_table,
                     ],
                 )
-            with gr.TabItem("2. Benchmark"):
+
+            with gr.TabItem("2. Методы встраивания ЦВЗ"):
                 gr.HTML(
                     _section_block(
-                        "Benchmark устойчивости",
-                        "Здесь система сама защищает изображение, применяет набор атак и после каждой атаки считает метрики.",
-                        "Эта вкладка нужна для оценки устойчивости, а не для единичного примера.",
+                        "Сравнение базовых методов",
+                        "Показывает, как работают OmniGuard, LSB и DCT на одном изображении.",
+                        "Раздел показывает результат встраивания, базовые метрики и технические параметры выбранного метода.",
                     )
                 )
                 with gr.Row():
                     with gr.Column():
-                        benchmark_image = gr.Image(label="Изображение для benchmark", type="numpy")
-                        benchmark_document_id = gr.Textbox(label="Document ID", placeholder="benchmark-001")
-                        benchmark_button = gr.Button("Запустить benchmark")
+                        method_image = gr.Image(label="Изображение", type="numpy")
+                        method_payload = gr.Textbox(label="Payload / document_id", value="diploma-demo-001")
+                        method_id = gr.Radio(choices=method_choices(), value="lsb", label="Метод встраивания")
+                        method_button = gr.Button("Встроить ЦВЗ")
+                    with gr.Column():
+                        method_output = gr.Image(label="Изображение с ЦВЗ", type="numpy")
+                        method_metrics = gr.Dataframe(
+                            headers=METHOD_METRIC_HEADERS,
+                            value=[["", "", ""]],
+                            label="Метрики метода",
+                        )
+                        with gr.Accordion("Технические детали метода", open=False):
+                            method_json = gr.Textbox(label="JSON", lines=14)
+                method_explanation = gr.Markdown()
+                method_button.click(
+                    method_demo_ui,
+                    inputs=[method_image, method_payload, method_id],
+                    outputs=[method_output, method_metrics, method_json, method_explanation],
+                )
+
+            with gr.TabItem("3. Пакетный benchmark"):
+                gr.HTML(
+                    _section_block(
+                        "Эксперимент на датасете",
+                        "Принимает много изображений, встраивает ЦВЗ выбранными методами, применяет атаки и считает PSNR, SSIM, bpp, BER.",
+                        "Подходит для 50-100 изображений. OmniGuard может работать дольше LSB/DCT; для быстрого чернового прогона его можно снять в списке методов.",
+                    )
+                )
+                with gr.Row():
+                    with gr.Column():
+                        benchmark_files = gr.File(
+                            label="Пул изображений",
+                            file_count="multiple",
+                            type="file",
+                            file_types=[".png", ".jpg", ".jpeg", ".bmp", ".webp"],
+                        )
+                        benchmark_folder = gr.Textbox(
+                            label="Или путь к папке с изображениями",
+                            placeholder=r"C:\Users\Mi\Downloads\dataset",
+                        )
+                        benchmark_payload = gr.Textbox(label="Payload / document_id", value="diploma-demo-001")
+                        benchmark_methods = gr.CheckboxGroup(
+                            choices=method_choices(),
+                            value=["omniguard", "lsb", "dct"],
+                            label="Методы для сравнения",
+                        )
+                        benchmark_button = gr.Button("Запустить пакетный benchmark")
                     with gr.Column():
                         benchmark_table = gr.Dataframe(
-                            headers=BENCHMARK_HEADERS,
-                            value=[[""] * len(BENCHMARK_HEADERS)],
+                            headers=REQUIREMENT_BENCHMARK_HEADERS,
+                            value=[[""] * len(REQUIREMENT_BENCHMARK_HEADERS)],
+                            label="Результаты benchmark",
                         )
-                        benchmark_report_path = gr.Textbox(label="Путь к JSON-отчету")
+                        benchmark_report_path = gr.Textbox(label="Путь к CSV-отчету")
                 benchmark_explanation = gr.Markdown()
                 benchmark_button.click(
-                    benchmark_ui,
-                    inputs=[benchmark_image, benchmark_document_id],
+                    batch_benchmark_ui,
+                    inputs=[benchmark_files, benchmark_folder, benchmark_payload, benchmark_methods],
                     outputs=[benchmark_table, benchmark_report_path, benchmark_explanation],
                 )
-            with gr.TabItem("3. Анализ внешнего файла"):
+
+            with gr.TabItem("4. Анализ внешнего файла"):
                 gr.HTML(
                     _section_block(
-                        "Анализ изображения, которое вы изменили вручную вне приложения",
-                        "Используй эту вкладку, если ты сохранил защищенное изображение, отредактировал его в Photoshop, Paint, GIMP или другом редакторе и теперь хочешь проверить результат нашим кодом.",
-                        "Лучший сценарий: загрузить измененный файл и отдельно загрузить защищенную опорную версию. Тогда гибридный режим даст самую точную локализацию.",
-                    )
-                )
-                gr.HTML(
-                    _note_block(
-                        "Как это работает: сначала загружаешь измененный файл, потом при желании добавляешь защищенную опорную версию, "
-                        "задаешь ожидаемый document_id и запускаешь анализ. В этом сценарии система проверяет payload и ищет области изменений "
-                        "без использования встроенных редакторов."
+                        "Проверка изображения после ручного редактирования",
+                        "Используй этот раздел, если изменил защищенное изображение в Photoshop, Paint, GIMP или другом редакторе.",
                     )
                 )
                 with gr.Row():
                     with gr.Column():
-                        external_analysis_image = gr.Image(
-                            label="Внешне измененное изображение",
-                            type="numpy",
-                        )
-                        external_reference_image = gr.Image(
-                            label="Защищенная опорная версия (рекомендуется)",
-                            type="numpy",
-                        )
-                        external_expected_document_id = gr.Textbox(
-                            label="Ожидаемый document_id",
-                            placeholder="diploma-demo-001",
-                        )
+                        external_analysis_image = gr.Image(label="Внешне измененное изображение", type="numpy")
+                        external_reference_image = gr.Image(label="Защищенная опорная версия", type="numpy")
+                        external_expected_document_id = gr.Textbox(label="Ожидаемый document_id", placeholder="diploma-demo-001")
                         external_analysis_mode = gr.Radio(
                             choices=[
                                 ("Гибридный: watermark + опорная версия", "hybrid"),
@@ -613,25 +763,17 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                             value=engine.settings.tamper_mask_threshold,
                             label="Порог бинарной маски",
                         )
-                        external_analyze_button = gr.Button("Запустить анализ внешнего файла")
+                        external_analyze_button = gr.Button("Запустить анализ")
                     with gr.Column():
-                        external_analysis_overlay = gr.Image(
-                            label="Heatmap для внешнего файла",
-                            type="numpy",
-                        )
-                        external_analysis_mask = gr.Image(
-                            label="Бинарная маска подозрительных областей",
-                            type="numpy",
-                        )
-                        external_analysis_json = gr.Textbox(
-                            label="Технический отчет анализа",
-                            lines=18,
-                        )
+                        external_analysis_overlay = gr.Image(label="Heatmap", type="numpy")
+                        external_analysis_mask = gr.Image(label="Бинарная маска", type="numpy")
+                        with gr.Accordion("Технический отчет анализа", open=False):
+                            external_analysis_json = gr.Textbox(label="JSON", lines=16)
                 external_analysis_explanation = gr.Markdown()
                 external_analysis_metrics_table = gr.Dataframe(
                     headers=ANALYSIS_METRIC_HEADERS,
                     value=[["", "", ""]],
-                    label="Ключевые метрики анализа внешнего файла",
+                    label="Ключевые показатели анализа",
                 )
                 external_analyze_button.click(
                     analyze_external_ui,
@@ -650,17 +792,34 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                         external_analysis_metrics_table,
                     ],
                 )
-            with gr.TabItem("4. Справка по разделам"):
-                gr.Markdown(interface_guide_md)
-            with gr.TabItem("5. Как интерпретировать анализ"):
-                gr.Markdown(analysis_interpretation_md)
-            with gr.TabItem("6. Метрики и формулы"):
-                gr.Markdown(metrics_reference_md)
-            with gr.TabItem("7. Подробный гайд"):
-                gr.Markdown(user_guide_md)
+
+            with gr.TabItem("5. Справочник"):
+                gr.HTML(
+                    _section_block(
+                        "Все объяснения в одном месте",
+                        "Внутри можно переключаться между подразделами: интерфейс, методы, атаки, метрики и интерпретация анализа.",
+                    )
+                )
+                with gr.Tabs():
+                    with gr.TabItem("Методология требований"):
+                        gr.Markdown(requirement_guide_md)
+                    with gr.TabItem("Пайплайн и heatmap"):
+                        gr.Markdown(technical_pipeline_md)
+                    with gr.TabItem("Разделы интерфейса"):
+                        gr.Markdown(INTERFACE_REFERENCE_MARKDOWN)
+                    with gr.TabItem("Методы ЦВЗ"):
+                        gr.Markdown(METHOD_REFERENCE_MARKDOWN)
+                    with gr.TabItem("Атаки"):
+                        gr.Markdown(ATTACK_REFERENCE_MARKDOWN)
+                    with gr.TabItem("Метрики и формулы"):
+                        gr.Markdown(METRIC_REFERENCE_MARKDOWN)
+                    with gr.TabItem("Как читать анализ"):
+                        gr.Markdown(ANALYSIS_REFERENCE_MARKDOWN)
+
     return demo
 
 
 def launch_ui(host: str = "127.0.0.1", port: int = 7860, share: bool = False) -> None:
+    os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
     app = create_app()
     app.launch(server_name=host, server_port=port, share=share)
