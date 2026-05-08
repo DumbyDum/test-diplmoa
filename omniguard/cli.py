@@ -6,6 +6,8 @@ from pathlib import Path
 from .benchmark import BenchmarkRunner
 from .dataset_generation import SyntheticDatasetBuilder
 from .image_ops import save_image
+from .paper_comparison import PaperComparisonRunner, rows_for_table
+from .attacks import PAPER_DEGRADATION_MAP, PAPER_LOCAL_EDIT_MAP
 from .service import OmniGuardEngine
 from .ui import launch_ui
 
@@ -42,6 +44,29 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument("--input", required=True, help="Path to input image.")
     benchmark_parser.add_argument("--output-dir", required=True, help="Directory for benchmark report.")
     benchmark_parser.add_argument("--document-id", required=True, help="Document ID to embed.")
+
+    paper_parser = subparsers.add_parser("paper-compare", help="Run paper-style baseline vs enhanced comparison.")
+    paper_parser.add_argument("--input", required=True, help="Path to input image.")
+    paper_parser.add_argument("--output-dir", required=True, help="Directory for comparison artifacts.")
+    paper_parser.add_argument("--document-id", required=True, help="Document ID to embed.")
+    paper_parser.add_argument(
+        "--local-edit",
+        default="opencv_inpaint_proxy",
+        choices=sorted(PAPER_LOCAL_EDIT_MAP.keys()),
+        help="Local edit scenario.",
+    )
+    paper_parser.add_argument(
+        "--degradation",
+        default="clean",
+        choices=sorted(PAPER_DEGRADATION_MAP.keys()),
+        help="Global degradation after the local edit.",
+    )
+    paper_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Optional override for the binary tamper-mask threshold.",
+    )
 
     dataset_parser = subparsers.add_parser("generate-dataset", help="Generate a synthetic dataset.")
     dataset_parser.add_argument("--input-dir", required=True, help="Directory with source images.")
@@ -92,6 +117,21 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
         )
         print(f"Benchmark report written to: {report_path.resolve()}")
+        return 0
+
+    if args.command == "paper-compare":
+        runner = PaperComparisonRunner(engine)
+        result = runner.run_generated(
+            image=args.input,
+            document_id=args.document_id,
+            local_edit_id=args.local_edit,
+            degradation_id=args.degradation,
+            threshold=args.threshold,
+            output_dir=args.output_dir,
+        )
+        print(f"Paper comparison report written to: {result.report_path.resolve()}")
+        for row in rows_for_table(result.rows):
+            print(" | ".join(str(value) for value in row))
         return 0
 
     if args.command == "generate-dataset":

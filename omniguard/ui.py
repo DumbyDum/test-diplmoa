@@ -12,6 +12,13 @@ from .attacks import ATTACK_REFERENCE_MARKDOWN
 from .basic_watermarking import METHOD_REFERENCE_MARKDOWN, method_choices
 from .editing import EDITOR_DESCRIPTIONS, EditingResult, editor_choices, editor_help_markdown
 from .image_ops import overlay_mask
+from .paper_comparison import (
+    PAPER_COMPARISON_HEADERS,
+    PaperComparisonRunner,
+    paper_degradation_choices,
+    paper_local_edit_choices,
+    rows_for_table as paper_rows_for_table,
+)
 from .requirement_experiments import RequirementExperimentRunner
 from .schemas import AnalysisResult, ProtectionResult
 from .service import OmniGuardEngine
@@ -162,6 +169,10 @@ INTERFACE_REFERENCE_MARKDOWN = """
 ## Пакетный benchmark
 
 Раздел принимает много изображений, встраивает ЦВЗ выбранными методами, применяет атаки из требований и считает метрики.
+
+## Сравнение со статьей
+
+Раздел воспроизводит набор метрик из статьи OmniGuard: `Capacity`, `PSNR`, `SSIM`, `Bit Accuracy`, `F1` и `AUC`. Базовая и улучшенная ветки проверяются в одинаковых условиях: одно protected image, одна атака, одна деградация и одна ground-truth маска.
 
 ## Анализ внешнего файла
 
@@ -412,9 +423,32 @@ def _benchmark_summary(rows: list[dict[str, Any]], report_path: Path) -> str:
     )
 
 
+def _paper_comparison_summary(rows: list[dict[str, Any]], report_path: Path) -> str:
+    baseline = rows[0] if rows else {}
+    enhanced = rows[1] if len(rows) > 1 else {}
+
+    def delta(metric: str) -> str:
+        left = baseline.get(metric)
+        right = enhanced.get(metric)
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            return "н/д"
+        return f"{right - left:+.6f}"
+
+    return (
+        "**Сравнение выполнено в одинаковых условиях.** Обе ветки получили одно и то же защищенное "
+        "изображение, одну и ту же локальную атаку, одну глобальную деградацию, один `document_id`, "
+        "одинаковые payload-биты и одну эталонную маску.\n\n"
+        f"- изменение `F1`: `{delta('F1')}`\n"
+        f"- изменение `AUC`: `{delta('AUC')}`\n"
+        f"- изменение `Bit Accuracy, %`: `{delta('Bit Accuracy, %')}`\n\n"
+        f"**JSON-отчет:** `{report_path}`"
+    )
+
+
 def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
     engine = engine or OmniGuardEngine()
     requirement_runner = RequirementExperimentRunner(engine)
+    paper_runner = PaperComparisonRunner(engine)
 
     requirement_guide_md = _doc_markdown(
         engine.settings.docs_dir / "REQUIREMENTS_ATTACKS_METRICS_METHODS.md",
@@ -423,6 +457,10 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
     technical_pipeline_md = _doc_markdown(
         engine.settings.docs_dir / "PIPELINE_METRICS_HEATMAP_DEEP_DIVE.md",
         "# Пайплайн, метрики и heatmap\n\nФайл справки не найден.",
+    )
+    paper_comparison_md = _doc_markdown(
+        engine.settings.docs_dir / "PAPER_METRICS_AND_COMPARISON.md",
+        "# Метрики статьи и сравнение\n\nФайл справки не найден.",
     )
 
     def protect_ui(image, document_id):
@@ -530,6 +568,32 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
             method_ids=selected_methods,
         )
         return _benchmark_rows_for_table(rows), str(report_path), _benchmark_summary(rows, report_path)
+
+    def paper_comparison_ui(image, document_id, local_edit_id, degradation_id, threshold):
+        if image is None:
+            raise gr.Error("Загрузите изображение для сравнения.")
+        if not document_id.strip():
+            raise gr.Error("Укажите document_id.")
+        result = paper_runner.run_generated(
+            image,
+            document_id.strip(),
+            local_edit_id=local_edit_id,
+            degradation_id=degradation_id,
+            threshold=float(threshold),
+        )
+        return (
+            result.protected_image,
+            result.attacked_image,
+            result.ground_truth_mask,
+            result.baseline_overlay,
+            result.baseline_mask,
+            result.enhanced_overlay,
+            result.enhanced_mask,
+            paper_rows_for_table(result.rows),
+            str(result.report_path),
+            _paper_comparison_summary(result.rows, result.report_path),
+            _json_dump(result.report),
+        )
 
     with gr.Blocks(title="OmniGuard 2.0", css=CUSTOM_CSS, theme=gr.themes.Soft()) as demo:
         payload_bits_state = gr.State([])
@@ -735,7 +799,80 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                     outputs=[benchmark_table, benchmark_report_path, benchmark_explanation],
                 )
 
-            with gr.TabItem("4. Анализ внешнего файла"):
+            with gr.TabItem("4. Сравнение со статьей"):
+                gr.HTML(
+                    _section_block(
+                        "Paper-compatible сравнение",
+                        "Считает метрики из статьи OmniGuard для базовой watermark-only локализации и улучшенной hybrid-локализации.",
+                        "Обе ветки получают один и тот же protected image, одну и ту же атаку, один document_id и одну ground-truth маску.",
+                    )
+                )
+                gr.Markdown(
+                    "Здесь базовая версия означает режим `watermark-only residual`: анализ строит карту только по нарушению "
+                    "встроенного локального watermark. Улучшенная версия использует гибридную карту: watermark + сравнение "
+                    "с защищенной опорной версией + адаптивная бинаризация."
+                )
+                with gr.Row():
+                    with gr.Column():
+                        paper_image = gr.Image(label="Исходное изображение", type="numpy")
+                        paper_document_id = gr.Textbox(label="Document ID", value="paper-demo-001")
+                        paper_local_edit = gr.Dropdown(
+                            choices=paper_local_edit_choices(),
+                            value="opencv_inpaint_proxy",
+                            label="Локальная атака",
+                        )
+                        paper_degradation = gr.Dropdown(
+                            choices=paper_degradation_choices(),
+                            value="clean",
+                            label="Глобальная деградация после локальной атаки",
+                        )
+                        paper_threshold = gr.Slider(
+                            minimum=0.01,
+                            maximum=0.50,
+                            step=0.01,
+                            value=engine.settings.tamper_mask_threshold,
+                            label="Порог бинарной маски для F1",
+                        )
+                        paper_button = gr.Button("Запустить сравнение")
+                    with gr.Column():
+                        paper_protected_image = gr.Image(label="Protected image", type="numpy")
+                        paper_attacked_image = gr.Image(label="Attacked / received image", type="numpy")
+                        paper_gt_mask = gr.Image(label="Ground-truth маска атаки", type="numpy")
+                with gr.Row():
+                    with gr.Column():
+                        paper_baseline_overlay = gr.Image(label="Базовая версия: heatmap", type="numpy")
+                        paper_baseline_mask = gr.Image(label="Базовая версия: binary mask", type="numpy")
+                    with gr.Column():
+                        paper_enhanced_overlay = gr.Image(label="Улучшенная версия: heatmap", type="numpy")
+                        paper_enhanced_mask = gr.Image(label="Улучшенная версия: binary mask", type="numpy")
+                paper_table = gr.Dataframe(
+                    headers=PAPER_COMPARISON_HEADERS,
+                    value=[[""] * len(PAPER_COMPARISON_HEADERS)],
+                    label="Метрики из статьи OmniGuard",
+                )
+                paper_report_path = gr.Textbox(label="Путь к JSON-отчету")
+                paper_summary = gr.Markdown()
+                with gr.Accordion("Технический отчет сравнения", open=False):
+                    paper_json = gr.Textbox(label="JSON", lines=18)
+                paper_button.click(
+                    paper_comparison_ui,
+                    inputs=[paper_image, paper_document_id, paper_local_edit, paper_degradation, paper_threshold],
+                    outputs=[
+                        paper_protected_image,
+                        paper_attacked_image,
+                        paper_gt_mask,
+                        paper_baseline_overlay,
+                        paper_baseline_mask,
+                        paper_enhanced_overlay,
+                        paper_enhanced_mask,
+                        paper_table,
+                        paper_report_path,
+                        paper_summary,
+                        paper_json,
+                    ],
+                )
+
+            with gr.TabItem("5. Анализ внешнего файла"):
                 gr.HTML(
                     _section_block(
                         "Проверка изображения после ручного редактирования",
@@ -793,7 +930,7 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                     ],
                 )
 
-            with gr.TabItem("5. Справочник"):
+            with gr.TabItem("6. Справочник"):
                 gr.HTML(
                     _section_block(
                         "Все объяснения в одном месте",
@@ -805,6 +942,8 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                         gr.Markdown(requirement_guide_md)
                     with gr.TabItem("Пайплайн и heatmap"):
                         gr.Markdown(technical_pipeline_md)
+                    with gr.TabItem("Метрики статьи OmniGuard"):
+                        gr.Markdown(paper_comparison_md)
                     with gr.TabItem("Разделы интерфейса"):
                         gr.Markdown(INTERFACE_REFERENCE_MARKDOWN)
                     with gr.TabItem("Методы ЦВЗ"):

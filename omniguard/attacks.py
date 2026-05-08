@@ -142,6 +142,87 @@ def masked_edit(image: np.ndarray, mask: np.ndarray, method: str = "inpaint") ->
     return AttackOutput(image=cv2.cvtColor(edited, cv2.COLOR_BGR2RGB), mask=mask_uint8)
 
 
+def gaussian_noise_pixels(image: np.ndarray, mean: float = 0.0, sigma: float = 25.0, seed: int = 41) -> AttackOutput:
+    source = ensure_rgb_uint8(image).astype(np.float32)
+    rng = np.random.default_rng(seed)
+    noisy = source + rng.normal(mean, sigma, source.shape).astype(np.float32)
+    return AttackOutput(image=np.clip(noisy, 0.0, 255.0).astype(np.uint8))
+
+
+def color_jitter(
+    image: np.ndarray,
+    *,
+    brightness: float = 1.0,
+    contrast: float = 1.0,
+    saturation: float = 1.0,
+) -> AttackOutput:
+    pil_image = Image.fromarray(ensure_rgb_uint8(image))
+    pil_image = ImageEnhance.Brightness(pil_image).enhance(brightness)
+    pil_image = ImageEnhance.Contrast(pil_image).enhance(contrast)
+    pil_image = ImageEnhance.Color(pil_image).enhance(saturation)
+    return AttackOutput(image=np.array(pil_image))
+
+
+def random_dropout(image: np.ndarray, amount: float = 0.10, seed: int = 43) -> AttackOutput:
+    source = ensure_rgb_uint8(image).copy()
+    rng = np.random.default_rng(seed)
+    dropout_mask = rng.random(source.shape[:2]) < amount
+    source[dropout_mask] = 0
+    return AttackOutput(image=source)
+
+
+PAPER_LOCAL_EDITS: tuple[tuple[str, str, AttackCallable], ...] = (
+    (
+        "opencv_inpaint_proxy",
+        "Локальный inpaint-прокси: прямоугольная область заменяется OpenCV Telea-inpainting",
+        rectangular_inpaint,
+    ),
+    (
+        "splicing_copy_move",
+        "Splicing / copy-move: фрагмент изображения копируется в другую область",
+        copy_move,
+    ),
+)
+
+
+PAPER_DEGRADATIONS: tuple[tuple[str, str, AttackCallable], ...] = (
+    ("clean", "Без глобальной деградации", identity),
+    ("jpeg_q70", "JPEG Q=70, как в сравнении deep watermarking из статьи", lambda image: jpeg_roundtrip(image, quality=70)),
+    ("jpeg_q85", "JPEG Q=85, верхняя граница диапазона Q=70-85 из статьи", lambda image: jpeg_roundtrip(image, quality=85)),
+    (
+        "gaussian_sigma25",
+        "Gaussian noise с sigma=25 в шкале пикселей 0-255",
+        lambda image: gaussian_noise_pixels(image, sigma=25.0),
+    ),
+    (
+        "gaussian_sigma10",
+        "Gaussian noise с sigma=10, верхняя граница диапазона sigma=1-10 для локализации",
+        lambda image: gaussian_noise_pixels(image, sigma=10.0),
+    ),
+    (
+        "brightness_plus_30_percent",
+        "ColorJitter: яркость увеличена на 30%",
+        lambda image: color_jitter(image, brightness=1.30),
+    ),
+    (
+        "brightness_minus_30_percent",
+        "ColorJitter: яркость уменьшена на 30%",
+        lambda image: color_jitter(image, brightness=0.70),
+    ),
+    (
+        "color_jitter_bcs",
+        "ColorJitter по яркости, контрасту и насыщенности",
+        lambda image: color_jitter(image, brightness=1.15, contrast=1.15, saturation=0.85),
+    ),
+    ("salt_pepper", "Salt-and-Pepper noise", salt_and_pepper_noise),
+    ("random_dropout", "Random Dropout: случайные пиксели зануляются", random_dropout),
+)
+
+
+PAPER_LOCAL_EDIT_MAP: dict[str, AttackCallable] = {name: attack_fn for name, _, attack_fn in PAPER_LOCAL_EDITS}
+PAPER_DEGRADATION_MAP: dict[str, AttackCallable] = {name: attack_fn for name, _, attack_fn in PAPER_DEGRADATIONS}
+
+
 REQUIREMENT_ATTACKS: tuple[tuple[str, str, AttackCallable], ...] = (
     ("jpeg_q100", "JPEG-сжатие с качеством QF=100", lambda image: jpeg_roundtrip(image, quality=100)),
     ("jpeg_q90", "JPEG-сжатие с качеством QF=90", lambda image: jpeg_roundtrip(image, quality=90)),
@@ -169,4 +250,10 @@ ATTACK_REFERENCE_MARKDOWN = """
 6. **Изменение яркости (*1.5, *0.8).** Каждый пиксель умножается на коэффициент: `I' = clip(I * alpha)`.
 7. **Median filter (3x3).** Каждый пиксель заменяется медианой соседей в окне `3x3`, что подавляет шум и может разрушать слабый ЦВЗ.
 8. **Уменьшение с возвращением.** Изображение уменьшается в 2 раза и увеличивается обратно; мелкие детали и часть скрытого сигнала теряются.
+
+### Атаки для сравнения со статьей OmniGuard
+
+В статье для локализации используются локальные изменения `Stable Diffusion Inpaint`, `ControlNet Inpaint` и `image splicing`, а затем возможная глобальная деградация. В прототипе без внешних генеративных моделей используются воспроизводимые локальные аналоги: `OpenCV inpaint` и `copy-move / splicing`. Это позволяет честно сравнивать две ветки алгоритма на одной и той же эталонной маске.
+
+Глобальные деградации из статьи добавлены отдельным набором: `JPEG Q=70`, `JPEG Q=85`, `Gaussian noise sigma=25`, `Gaussian noise sigma=10`, `ColorJitter` по яркости/контрасту/насыщенности, яркость `+30%`, яркость `-30%`, `Salt-and-Pepper` и `Random Dropout`.
 """

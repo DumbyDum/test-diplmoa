@@ -148,6 +148,50 @@ def mask_f1(mask_true: np.ndarray, mask_pred: np.ndarray, threshold: int = 127) 
     return float((2.0 * precision * recall) / denom)
 
 
+def mask_auc(mask_true: np.ndarray, score_map: np.ndarray, threshold: int = 127) -> float | None:
+    """ROC-AUC for a tamper score map against a binary ground-truth mask.
+
+    AUC answers the paper-style question: how often a truly edited pixel receives
+    a higher suspiciousness score than an untouched pixel. It is threshold-free,
+    unlike F1, so it is useful when comparing localization methods fairly.
+    """
+    true_mask = ensure_mask_uint8(mask_true) > threshold
+    scores = np.asarray(score_map)
+    if scores.ndim == 3:
+        scores = scores[..., 0]
+    scores = scores.astype(np.float64)
+    if scores.size == 0:
+        return None
+    max_score = float(np.nanmax(scores))
+    if max_score > 1.0:
+        scores = scores / 255.0
+    scores = np.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0).reshape(-1)
+    labels = true_mask.reshape(-1)
+    positive_count = int(labels.sum())
+    negative_count = int(labels.size - positive_count)
+    if positive_count == 0 or negative_count == 0:
+        return None
+
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    ranks = np.empty_like(scores, dtype=np.float64)
+    start = 0
+    while start < sorted_scores.size:
+        end = start + 1
+        while end < sorted_scores.size and sorted_scores[end] == sorted_scores[start]:
+            end += 1
+        # Average rank for ties. Ranks are one-based in the Mann-Whitney formula.
+        average_rank = (start + 1 + end) / 2.0
+        ranks[order[start:end]] = average_rank
+        start = end
+
+    positive_rank_sum = float(ranks[labels].sum())
+    auc = (positive_rank_sum - positive_count * (positive_count + 1) / 2.0) / (
+        positive_count * negative_count
+    )
+    return float(np.clip(auc, 0.0, 1.0))
+
+
 def bit_accuracy(bits_a: list[int], bits_b: list[int]) -> float | None:
     if not bits_a or not bits_b:
         return None

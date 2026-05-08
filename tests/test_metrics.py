@@ -13,6 +13,7 @@ from omniguard.metrics import (
     mask_dice,
     mask_f1,
     mask_iou,
+    mask_auc,
     mask_precision,
     mask_recall,
     mse,
@@ -46,6 +47,16 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(mask_precision(mask_a, mask_b), 1.0)
         self.assertEqual(mask_recall(mask_a, mask_b), 1.0)
         self.assertEqual(mask_f1(mask_a, mask_b), 1.0)
+
+    def test_mask_auc(self) -> None:
+        ground_truth = np.zeros((4, 4), dtype=np.uint8)
+        ground_truth[0:2, 0:2] = 255
+        perfect_scores = np.zeros((4, 4), dtype=np.float32)
+        perfect_scores[0:2, 0:2] = 1.0
+        reversed_scores = 1.0 - perfect_scores
+        self.assertEqual(mask_auc(ground_truth, perfect_scores), 1.0)
+        self.assertEqual(mask_auc(ground_truth, reversed_scores), 0.0)
+        self.assertIsNone(mask_auc(np.zeros((4, 4), dtype=np.uint8), perfect_scores))
 
     def test_bit_accuracy(self) -> None:
         self.assertEqual(bit_accuracy([1, 0, 1], [1, 0, 1]), 1.0)
