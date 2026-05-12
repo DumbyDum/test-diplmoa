@@ -4,6 +4,7 @@ import base64
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import gradio as gr
@@ -13,11 +14,13 @@ from .basic_watermarking import METHOD_REFERENCE_MARKDOWN, method_choices
 from .editing import EDITOR_DESCRIPTIONS, EditingResult, editor_choices, editor_help_markdown
 from .image_ops import overlay_mask
 from .paper_comparison import (
-    PAPER_COMPARISON_HEADERS,
+    PAPER_AGGREGATE_HEADERS,
+    PAPER_BATCH_HEADERS,
     PaperComparisonRunner,
+    aggregate_rows_for_table as paper_aggregate_rows_for_table,
+    batch_rows_for_table as paper_batch_rows_for_table,
     paper_degradation_choices,
     paper_local_edit_choices,
-    rows_for_table as paper_rows_for_table,
 )
 from .requirement_experiments import RequirementExperimentRunner
 from .schemas import AnalysisResult, ProtectionResult
@@ -172,11 +175,7 @@ INTERFACE_REFERENCE_MARKDOWN = """
 
 ## Сравнение со статьей
 
-Раздел воспроизводит набор метрик из статьи OmniGuard: `Capacity`, `PSNR`, `SSIM`, `Bit Accuracy`, `F1` и `AUC`. Базовая и улучшенная ветки проверяются в одинаковых условиях: одно protected image, одна атака, одна деградация и одна ground-truth маска.
-
-## Анализ внешнего файла
-
-Нужен, если защищенное изображение было изменено вручную во внешнем редакторе. Сюда загружается измененная версия и, желательно, защищенная опорная версия.
+Раздел воспроизводит набор метрик из статьи OmniGuard: `Capacity`, `PSNR`, `SSIM`, `Bit Accuracy`, `F1` и `AUC`. Изначальная и улучшенная ветки проверяются в одинаковых условиях. Можно загрузить одно изображение, несколько файлов или указать папку.
 
 ## Справочник
 
@@ -423,25 +422,31 @@ def _benchmark_summary(rows: list[dict[str, Any]], report_path: Path) -> str:
     )
 
 
-def _paper_comparison_summary(rows: list[dict[str, Any]], report_path: Path) -> str:
-    baseline = rows[0] if rows else {}
-    enhanced = rows[1] if len(rows) > 1 else {}
+def _paper_comparison_summary(
+    aggregate_rows: list[dict[str, Any]],
+    report_path: Path,
+    csv_path: Path | None = None,
+) -> str:
+    baseline = next((row for row in aggregate_rows if str(row.get("Метод", "")).startswith("Изначальный")), {})
+    enhanced = next((row for row in aggregate_rows if str(row.get("Метод", "")).startswith("Улучшенная")), {})
 
     def delta(metric: str) -> str:
-        left = baseline.get(metric)
-        right = enhanced.get(metric)
+        left = baseline.get(f"Средний {metric}")
+        right = enhanced.get(f"Средний {metric}")
         if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
             return "н/д"
         return f"{right - left:+.6f}"
 
+    csv_line = f"\n\n**CSV с построчными результатами:** `{csv_path}`" if csv_path is not None else ""
     return (
-        "**Сравнение выполнено в одинаковых условиях.** Обе ветки получили одно и то же защищенное "
-        "изображение, одну и ту же локальную атаку, одну глобальную деградацию, один `document_id`, "
-        "одинаковые payload-биты и одну эталонную маску.\n\n"
-        f"- изменение `F1`: `{delta('F1')}`\n"
-        f"- изменение `AUC`: `{delta('AUC')}`\n"
-        f"- изменение `Bit Accuracy, %`: `{delta('Bit Accuracy, %')}`\n\n"
+        "**Сравнение выполнено в одинаковых условиях.** Для каждого изображения обе ветки получили "
+        "один и тот же protected image, одну локальную атаку, одну глобальную деградацию, одинаковые "
+        "`document_id`/payload-биты и одну эталонную маску.\n\n"
+        f"- среднее изменение `F1`: `{delta('F1')}`\n"
+        f"- среднее изменение `AUC`: `{delta('AUC')}`\n"
+        f"- среднее изменение `Bit Accuracy, %`: `{delta('Bit Accuracy, %')}`\n\n"
         f"**JSON-отчет:** `{report_path}`"
+        f"{csv_line}"
     )
 
 
@@ -515,26 +520,6 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
             _analysis_metrics_rows(result),
         )
 
-    def analyze_external_ui(external_image, protected_reference, expected_document_id, analysis_mode, threshold):
-        if external_image is None:
-            raise gr.Error("Загрузите внешне измененное изображение.")
-        if analysis_mode == "reference" and protected_reference is None:
-            raise gr.Error("Для режима сравнения нужна защищенная опорная версия.")
-        result = engine.analyze_image(
-            external_image,
-            expected_document_id=expected_document_id.strip() or None,
-            reference_image=protected_reference,
-            analysis_mode=analysis_mode,
-            threshold_override=float(threshold),
-        )
-        return (
-            overlay_mask(external_image, result.tamper_heatmap),
-            result.binary_mask,
-            _json_dump(_analysis_report(result)),
-            _analysis_markdown(result),
-            _analysis_metrics_rows(result),
-        )
-
     def method_demo_ui(image, payload_text, method_id):
         if image is None:
             raise gr.Error("Загрузите изображение.")
@@ -569,30 +554,91 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
         )
         return _benchmark_rows_for_table(rows), str(report_path), _benchmark_summary(rows, report_path)
 
-    def paper_comparison_ui(image, document_id, local_edit_id, degradation_id, threshold):
-        if image is None:
-            raise gr.Error("Загрузите изображение для сравнения.")
+    def paper_comparison_ui(image, uploaded_files, folder_path, document_id, local_edit_id, degradation_id, threshold):
         if not document_id.strip():
             raise gr.Error("Укажите document_id.")
-        result = paper_runner.run_generated(
-            image,
-            document_id.strip(),
-            local_edit_id=local_edit_id,
-            degradation_id=degradation_id,
-            threshold=float(threshold),
-        )
+        image_paths = paper_runner.collect_images(uploaded_files, folder_path)
+        if image_paths:
+            batch = paper_runner.run_batch(
+                image_paths,
+                document_id.strip(),
+                local_edit_id=local_edit_id,
+                degradation_id=degradation_id,
+                threshold=float(threshold),
+            )
+        else:
+            if image is None:
+                raise gr.Error("Загрузите одно изображение, несколько файлов или укажите папку.")
+            result = paper_runner.run_generated(
+                image,
+                document_id.strip(),
+                local_edit_id=local_edit_id,
+                degradation_id=degradation_id,
+                threshold=float(threshold),
+            )
+            rows = [
+                {
+                    "Изображение": "single_ui_image",
+                    "document_id": document_id.strip(),
+                    "Локальная атака": local_edit_id,
+                    "Глобальная деградация": degradation_id,
+                    "Статус": "ok",
+                    "report_path": str(result.report_path),
+                    **row,
+                }
+                for row in result.rows
+            ]
+            aggregate_rows = paper_runner._aggregate_rows(rows)
+            output_root = result.report_path.parent
+            csv_path = output_root / "paper_comparison_rows.csv"
+            aggregate_csv_path = output_root / "paper_comparison_summary.csv"
+            paper_runner._save_csv(rows, csv_path)
+            paper_runner._save_csv(aggregate_rows, aggregate_csv_path)
+            report_path = engine.save_json(
+                {
+                    "document_id_base": document_id.strip(),
+                    "local_edit_id": local_edit_id,
+                    "degradation_id": degradation_id,
+                    "threshold": float(threshold),
+                    "images": ["single_ui_image"],
+                    "rows": rows,
+                    "aggregate_rows": aggregate_rows,
+                    "single_report": str(result.report_path),
+                },
+                output_root / "paper_comparison_batch_report.json",
+            )
+            batch = SimpleNamespace(
+                rows=rows,
+                aggregate_rows=aggregate_rows,
+                report_path=report_path,
+                csv_path=csv_path,
+                aggregate_csv_path=aggregate_csv_path,
+                preview=result,
+            )
+
+        preview = batch.preview
+        if preview is None:
+            raise gr.Error("Не удалось построить preview: проверьте входные изображения.")
+        report_payload = {
+            "batch_report_path": str(batch.report_path),
+            "csv_path": str(batch.csv_path),
+            "aggregate_csv_path": str(batch.aggregate_csv_path),
+            "rows_preview_count": min(len(batch.rows), 500),
+            "aggregate_rows": batch.aggregate_rows,
+        }
         return (
-            result.protected_image,
-            result.attacked_image,
-            result.ground_truth_mask,
-            result.baseline_overlay,
-            result.baseline_mask,
-            result.enhanced_overlay,
-            result.enhanced_mask,
-            paper_rows_for_table(result.rows),
-            str(result.report_path),
-            _paper_comparison_summary(result.rows, result.report_path),
-            _json_dump(result.report),
+            preview.protected_image,
+            preview.attacked_image,
+            preview.ground_truth_mask,
+            preview.baseline_overlay,
+            preview.baseline_mask,
+            preview.enhanced_overlay,
+            preview.enhanced_mask,
+            paper_batch_rows_for_table(batch.rows),
+            paper_aggregate_rows_for_table(batch.aggregate_rows),
+            str(batch.report_path),
+            _paper_comparison_summary(batch.aggregate_rows, batch.report_path, batch.csv_path),
+            _json_dump(report_payload),
         )
 
     with gr.Blocks(title="OmniGuard 2.0", css=CUSTOM_CSS, theme=gr.themes.Soft()) as demo:
@@ -802,19 +848,29 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
             with gr.TabItem("4. Сравнение со статьей"):
                 gr.HTML(
                     _section_block(
-                        "Paper-compatible сравнение",
-                        "Считает метрики из статьи OmniGuard для базовой watermark-only локализации и улучшенной hybrid-локализации.",
-                        "Обе ветки получают один и тот же protected image, одну и ту же атаку, один document_id и одну ground-truth маску.",
+                        "Сравнение изначального и улучшенного метода",
+                        "Считает метрики из статьи OmniGuard для изначальной watermark-only локализации и улучшенной hybrid-локализации.",
+                        "Можно загрузить одно изображение, несколько файлов или папку. Для каждого изображения обе ветки получают одинаковые условия.",
                     )
                 )
                 gr.Markdown(
-                    "Здесь базовая версия означает режим `watermark-only residual`: анализ строит карту только по нарушению "
-                    "встроенного локального watermark. Улучшенная версия использует гибридную карту: watermark + сравнение "
-                    "с защищенной опорной версией + адаптивная бинаризация."
+                    "Изначальный OmniGuard в этом сравнении представлен исполняемой логикой `watermark-only residual`: "
+                    "карта строится только по нарушению локального watermark. Улучшенная версия использует `hybrid`: "
+                    "watermark + сравнение с protected reference + адаптивная бинаризация."
                 )
                 with gr.Row():
                     with gr.Column():
-                        paper_image = gr.Image(label="Исходное изображение", type="numpy")
+                        paper_image = gr.Image(label="Одно изображение для быстрого теста", type="numpy")
+                        paper_files = gr.File(
+                            label="Или пул изображений",
+                            file_count="multiple",
+                            type="file",
+                            file_types=[".png", ".jpg", ".jpeg", ".bmp", ".webp"],
+                        )
+                        paper_folder = gr.Textbox(
+                            label="Или путь к папке с изображениями",
+                            placeholder=r"C:\Users\Mi\Downloads\dataset",
+                        )
                         paper_document_id = gr.Textbox(label="Document ID", value="paper-demo-001")
                         paper_local_edit = gr.Dropdown(
                             choices=paper_local_edit_choices(),
@@ -835,20 +891,25 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                         )
                         paper_button = gr.Button("Запустить сравнение")
                     with gr.Column():
-                        paper_protected_image = gr.Image(label="Protected image", type="numpy")
-                        paper_attacked_image = gr.Image(label="Attacked / received image", type="numpy")
-                        paper_gt_mask = gr.Image(label="Ground-truth маска атаки", type="numpy")
+                        paper_protected_image = gr.Image(label="Preview: protected image", type="numpy")
+                        paper_attacked_image = gr.Image(label="Preview: attacked / received image", type="numpy")
+                        paper_gt_mask = gr.Image(label="Preview: ground-truth маска атаки", type="numpy")
                 with gr.Row():
                     with gr.Column():
-                        paper_baseline_overlay = gr.Image(label="Базовая версия: heatmap", type="numpy")
-                        paper_baseline_mask = gr.Image(label="Базовая версия: binary mask", type="numpy")
+                        paper_baseline_overlay = gr.Image(label="Изначальный OmniGuard: heatmap", type="numpy")
+                        paper_baseline_mask = gr.Image(label="Изначальный OmniGuard: binary mask", type="numpy")
                     with gr.Column():
                         paper_enhanced_overlay = gr.Image(label="Улучшенная версия: heatmap", type="numpy")
                         paper_enhanced_mask = gr.Image(label="Улучшенная версия: binary mask", type="numpy")
                 paper_table = gr.Dataframe(
-                    headers=PAPER_COMPARISON_HEADERS,
-                    value=[[""] * len(PAPER_COMPARISON_HEADERS)],
-                    label="Метрики из статьи OmniGuard",
+                    headers=PAPER_BATCH_HEADERS,
+                    value=[[""] * len(PAPER_BATCH_HEADERS)],
+                    label="Метрики по каждому изображению",
+                )
+                paper_aggregate_table = gr.Dataframe(
+                    headers=PAPER_AGGREGATE_HEADERS,
+                    value=[[""] * len(PAPER_AGGREGATE_HEADERS)],
+                    label="Средние значения по методам",
                 )
                 paper_report_path = gr.Textbox(label="Путь к JSON-отчету")
                 paper_summary = gr.Markdown()
@@ -856,7 +917,15 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                     paper_json = gr.Textbox(label="JSON", lines=18)
                 paper_button.click(
                     paper_comparison_ui,
-                    inputs=[paper_image, paper_document_id, paper_local_edit, paper_degradation, paper_threshold],
+                    inputs=[
+                        paper_image,
+                        paper_files,
+                        paper_folder,
+                        paper_document_id,
+                        paper_local_edit,
+                        paper_degradation,
+                        paper_threshold,
+                    ],
                     outputs=[
                         paper_protected_image,
                         paper_attacked_image,
@@ -866,71 +935,14 @@ def create_app(engine: OmniGuardEngine | None = None) -> gr.Blocks:
                         paper_enhanced_overlay,
                         paper_enhanced_mask,
                         paper_table,
+                        paper_aggregate_table,
                         paper_report_path,
                         paper_summary,
                         paper_json,
                     ],
                 )
 
-            with gr.TabItem("5. Анализ внешнего файла"):
-                gr.HTML(
-                    _section_block(
-                        "Проверка изображения после ручного редактирования",
-                        "Используй этот раздел, если изменил защищенное изображение в Photoshop, Paint, GIMP или другом редакторе.",
-                    )
-                )
-                with gr.Row():
-                    with gr.Column():
-                        external_analysis_image = gr.Image(label="Внешне измененное изображение", type="numpy")
-                        external_reference_image = gr.Image(label="Защищенная опорная версия", type="numpy")
-                        external_expected_document_id = gr.Textbox(label="Ожидаемый document_id", placeholder="diploma-demo-001")
-                        external_analysis_mode = gr.Radio(
-                            choices=[
-                                ("Гибридный: watermark + опорная версия", "hybrid"),
-                                ("Только watermark", "watermark"),
-                                ("Только сравнение с опорной версией", "reference"),
-                            ],
-                            value="hybrid",
-                            label="Режим локализации",
-                        )
-                        external_threshold_slider = gr.Slider(
-                            minimum=0.01,
-                            maximum=0.50,
-                            step=0.01,
-                            value=engine.settings.tamper_mask_threshold,
-                            label="Порог бинарной маски",
-                        )
-                        external_analyze_button = gr.Button("Запустить анализ")
-                    with gr.Column():
-                        external_analysis_overlay = gr.Image(label="Heatmap", type="numpy")
-                        external_analysis_mask = gr.Image(label="Бинарная маска", type="numpy")
-                        with gr.Accordion("Технический отчет анализа", open=False):
-                            external_analysis_json = gr.Textbox(label="JSON", lines=16)
-                external_analysis_explanation = gr.Markdown()
-                external_analysis_metrics_table = gr.Dataframe(
-                    headers=ANALYSIS_METRIC_HEADERS,
-                    value=[["", "", ""]],
-                    label="Ключевые показатели анализа",
-                )
-                external_analyze_button.click(
-                    analyze_external_ui,
-                    inputs=[
-                        external_analysis_image,
-                        external_reference_image,
-                        external_expected_document_id,
-                        external_analysis_mode,
-                        external_threshold_slider,
-                    ],
-                    outputs=[
-                        external_analysis_overlay,
-                        external_analysis_mask,
-                        external_analysis_json,
-                        external_analysis_explanation,
-                        external_analysis_metrics_table,
-                    ],
-                )
-
-            with gr.TabItem("6. Справочник"):
+            with gr.TabItem("5. Справочник"):
                 gr.HTML(
                     _section_block(
                         "Все объяснения в одном месте",

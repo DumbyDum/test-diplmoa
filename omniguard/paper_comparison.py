@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -28,6 +29,41 @@ PAPER_COMPARISON_HEADERS = [
     "document_match",
 ]
 
+PAPER_BATCH_HEADERS = [
+    "Изображение",
+    "Метод",
+    "Локальная атака",
+    "Глобальная деградация",
+    "Capacity, bits",
+    "PSNR",
+    "SSIM",
+    "payload_bpp",
+    "Bit Accuracy, %",
+    "BER",
+    "F1",
+    "AUC",
+    "tamper_ratio",
+    "payload_auth_ok",
+    "document_match",
+    "Статус",
+]
+
+PAPER_AGGREGATE_HEADERS = [
+    "Метод",
+    "Изображений",
+    "Средний PSNR",
+    "Средний SSIM",
+    "Средний Bit Accuracy, %",
+    "Средний BER",
+    "Средний F1",
+    "Средний AUC",
+    "Средний tamper_ratio",
+]
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+BASELINE_METHOD_NAME = "Изначальный OmniGuard: watermark-only residual"
+ENHANCED_METHOD_NAME = "Улучшенная версия: hybrid watermark + reference"
+
 
 @dataclass(slots=True)
 class PaperComparisonResult:
@@ -41,6 +77,16 @@ class PaperComparisonResult:
     rows: list[dict[str, Any]]
     report: dict[str, Any]
     report_path: Path
+
+
+@dataclass(slots=True)
+class PaperBatchComparisonResult:
+    rows: list[dict[str, Any]]
+    aggregate_rows: list[dict[str, Any]]
+    report_path: Path
+    csv_path: Path
+    aggregate_csv_path: Path
+    preview: PaperComparisonResult | None = None
 
 
 def paper_local_edit_choices() -> list[tuple[str, str]]:
@@ -92,6 +138,29 @@ class PaperComparisonRunner:
 
     def __init__(self, engine: OmniGuardEngine):
         self.engine = engine
+
+    def collect_images(self, uploaded_files: Iterable[Any] | None, folder_path: str | None) -> list[Path]:
+        paths: list[Path] = []
+        for file_item in uploaded_files or []:
+            candidate = getattr(file_item, "name", file_item)
+            if candidate:
+                paths.append(Path(candidate))
+
+        if folder_path and folder_path.strip():
+            folder = Path(folder_path.strip()).expanduser()
+            if folder.exists() and folder.is_dir():
+                for path in sorted(folder.rglob("*")):
+                    if path.suffix.lower() in IMAGE_EXTENSIONS:
+                        paths.append(path)
+
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in paths:
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key not in seen:
+                seen.add(key)
+                unique.append(path)
+        return unique
 
     def run_generated(
         self,
@@ -146,14 +215,14 @@ class PaperComparisonRunner:
 
         rows = [
             self._build_metric_row(
-                method_name="Базовая версия: watermark-only residual",
+                method_name=BASELINE_METHOD_NAME,
                 original=original,
                 protection=protection,
                 analysis=baseline,
                 ground_truth_mask=ground_truth_mask,
             ),
             self._build_metric_row(
-                method_name="Улучшенная версия: hybrid watermark + reference",
+                method_name=ENHANCED_METHOD_NAME,
                 original=original,
                 protection=protection,
                 analysis=enhanced,
@@ -201,6 +270,105 @@ class PaperComparisonRunner:
             report_path=report_path,
         )
 
+    def run_batch(
+        self,
+        image_paths: list[Path],
+        document_id: str,
+        *,
+        local_edit_id: str = "opencv_inpaint_proxy",
+        degradation_id: str = "clean",
+        threshold: float | None = None,
+        output_dir: str | Path | None = None,
+    ) -> PaperBatchComparisonResult:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_root = Path(output_dir) if output_dir is not None else (
+            self.engine.settings.runtime_dir / "paper_comparisons" / f"batch_{timestamp}"
+        )
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        rows: list[dict[str, Any]] = []
+        preview: PaperComparisonResult | None = None
+        for image_index, image_path in enumerate(image_paths, start=1):
+            sample_document_id = document_id if len(image_paths) == 1 else f"{document_id}-{image_index:04d}"
+            sample_dir = output_root / f"{image_index:04d}_{image_path.stem}"
+            try:
+                result = self.run_generated(
+                    image_path,
+                    sample_document_id,
+                    local_edit_id=local_edit_id,
+                    degradation_id=degradation_id,
+                    threshold=threshold,
+                    output_dir=sample_dir,
+                )
+                if preview is None:
+                    preview = result
+                for row in result.rows:
+                    rows.append(
+                        {
+                            "Изображение": image_path.name,
+                            "document_id": sample_document_id,
+                            "Локальная атака": local_edit_id,
+                            "Глобальная деградация": degradation_id,
+                            "Статус": "ok",
+                            "report_path": str(result.report_path),
+                            **row,
+                        }
+                    )
+            except Exception as exc:
+                rows.append(
+                    {
+                        "Изображение": image_path.name,
+                        "document_id": sample_document_id,
+                        "Метод": "",
+                        "Локальная атака": local_edit_id,
+                        "Глобальная деградация": degradation_id,
+                        "Capacity, bits": None,
+                        "PSNR": None,
+                        "SSIM": None,
+                        "payload_bpp": None,
+                        "Bit Accuracy, %": None,
+                        "BER": None,
+                        "F1": None,
+                        "AUC": None,
+                        "tamper_ratio": None,
+                        "payload_auth_ok": None,
+                        "document_match": None,
+                        "Статус": f"error: {exc}",
+                        "report_path": "",
+                    }
+                )
+
+        aggregate_rows = self._aggregate_rows(rows)
+        csv_path = output_root / "paper_comparison_rows.csv"
+        aggregate_csv_path = output_root / "paper_comparison_summary.csv"
+        self._save_csv(rows, csv_path)
+        self._save_csv(aggregate_rows, aggregate_csv_path)
+        report_path = self.engine.save_json(
+            {
+                "document_id_base": document_id,
+                "local_edit_id": local_edit_id,
+                "degradation_id": degradation_id,
+                "threshold": threshold if threshold is not None else self.engine.settings.tamper_mask_threshold,
+                "images": [str(path) for path in image_paths],
+                "method_mapping": {
+                    "original_omniguard": BASELINE_METHOD_NAME,
+                    "improved_version": ENHANCED_METHOD_NAME,
+                },
+                "metrics": PAPER_BATCH_HEADERS,
+                "rows": rows,
+                "aggregate_rows": aggregate_rows,
+            },
+            output_root / "paper_comparison_batch_report.json",
+        )
+        return PaperBatchComparisonResult(
+            rows=rows,
+            aggregate_rows=aggregate_rows,
+            report_path=report_path,
+            csv_path=csv_path,
+            aggregate_csv_path=aggregate_csv_path,
+            preview=preview,
+        )
+
     def _build_metric_row(
         self,
         *,
@@ -232,9 +400,71 @@ class PaperComparisonRunner:
             "payload_bpp": bpp(capacity_bits, protection.protected_image),
         }
 
+    def _aggregate_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        numeric_metrics = [
+            "PSNR",
+            "SSIM",
+            "Bit Accuracy, %",
+            "BER",
+            "F1",
+            "AUC",
+            "tamper_ratio",
+        ]
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            if row.get("Статус") != "ok":
+                continue
+            method = str(row.get("Метод", ""))
+            if method:
+                grouped.setdefault(method, []).append(row)
+
+        aggregate_rows: list[dict[str, Any]] = []
+        for method, method_rows in grouped.items():
+            aggregate: dict[str, Any] = {
+                "Метод": method,
+                "Изображений": len({row.get("Изображение") for row in method_rows}),
+            }
+            for metric in numeric_metrics:
+                values = [
+                    float(row[metric])
+                    for row in method_rows
+                    if isinstance(row.get(metric), (int, float))
+                ]
+                aggregate[f"Средний {metric}"] = (sum(values) / len(values)) if values else None
+            aggregate_rows.append(aggregate)
+        return aggregate_rows
+
+    def _save_csv(self, rows: list[dict[str, Any]], path: Path) -> None:
+        if not rows:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
 
 def rows_for_table(rows: list[dict[str, Any]]) -> list[list[Any]]:
     table: list[list[Any]] = []
     for row in rows:
         table.append([_metric_value(row.get(header)) for header in PAPER_COMPARISON_HEADERS])
+    return table
+
+
+def batch_rows_for_table(rows: list[dict[str, Any]], limit: int = 500) -> list[list[Any]]:
+    table: list[list[Any]] = []
+    for row in rows[:limit]:
+        table.append([_metric_value(row.get(header)) for header in PAPER_BATCH_HEADERS])
+    return table
+
+
+def aggregate_rows_for_table(rows: list[dict[str, Any]]) -> list[list[Any]]:
+    table: list[list[Any]] = []
+    for row in rows:
+        table.append([_metric_value(row.get(header)) for header in PAPER_AGGREGATE_HEADERS])
     return table
